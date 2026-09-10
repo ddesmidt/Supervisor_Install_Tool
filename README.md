@@ -122,7 +122,7 @@ Browser  ───────────────────────�
 
 **Backend** (`app/app.py`) — Python Flask:
 - All vCenter and NSX API calls are made server-side (avoids CORS)
-- Automatic VCF 9.1 SSO domain detection for vCenter authentication
+- Automatic SSO domain detection for vCenter authentication (see note below)
 - NSX credentials are passed per-request (never stored)
 
 **Frontend** (`app/templates/index_clarity.html`) — single-page app:
@@ -165,7 +165,7 @@ Supervisor_Intall_Tool/
 
 Credentials are entered in the browser and sent to the Flask backend per-request. They are never stored on disk.
 
-> **VCF 9.1 note**: WLD vCenter uses an internal SSO domain (e.g. `wld.sso`) rather than the federated `vcf.lab` domain. The app auto-detects the correct domain from the vCenter's `WWW-Authenticate` header.
+> **SSO domain auto-detection**: The app always tries the credentials as entered first. If vCenter responds with HTTP 401, the app reads the `WWW-Authenticate` header from that response — which contains the actual STS URL (e.g. `sts="https://vc/.../STSService/vsphere.local"`) — extracts the real SSO domain, and retries automatically. This means the app works with any SSO domain (`vsphere.local`, `wld.sso`, or any custom domain) without any manual configuration.
 
 ---
 
