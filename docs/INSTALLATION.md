@@ -4,12 +4,11 @@ This guide walks through deploying the **vSphere Supervisor Readiness Check + In
 
 ---
 
-> **Broadcom employees:** A pre-built VM OVA with the application already installed is available at:
-> [https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG](https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG)
+> **Broadcom employees:** A pre-built VM OVA with the application already installed is available on [Google Drive](https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG).
 >
-> After deploying the OVA, use the built-in `net-config` script (run as root) to set the VM's IP address — switch between DHCP and static, or enter a static IP / subnet / gateway / DNS. See [Network Configuration Script](#network-configuration-script) for details.
+> After deploying the OVA, the VM will obtain an IP via DHCP. To assign a static IP, log in as `root` (password: `VMware123!VMware123!`) and run the built-in `net-config` script — switch between DHCP and static, or enter a static IP / subnet / gateway / DNS. See [Network Configuration Script](#network-configuration-script) for details.
 >
-> Then skip straight to [Step 6 — Verify](#step-6--verify).
+> Then open a browser and navigate to `http://<VM-IP>/` to access the application, and skip straight to [Step 6 — Verify](#step-6--verify).
 
 ---
 

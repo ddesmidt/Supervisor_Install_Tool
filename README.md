@@ -44,7 +44,9 @@ The tool displays three side-by-side columns — one per deployment mode — eac
 
 ## Quick Start
 
-> **Broadcom employees:** A pre-built VM OVA with the application already installed is available at [Google Drive](https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG). Deploy the OVA and skip the install steps below.
+> **Broadcom employees:** A pre-built VM OVA with the application already installed is available on [Google Drive](https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG).
+> After deploying the OVA, the VM will obtain an IP via DHCP. To assign a static IP, log in as `root` (password: `VMware123!VMware123!`) and run the built-in `net-config` script — see [Network Configuration Script](docs/INSTALLATION.md#network-configuration-script) for details.
+> Then open a browser and navigate to `http://<VM-IP>/` to access the application, and skip the install steps below.
 
 ### Prerequisites
 
