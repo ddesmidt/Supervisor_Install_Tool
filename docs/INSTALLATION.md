@@ -6,7 +6,10 @@ This guide walks through deploying the **vSphere Supervisor Readiness Check + In
 
 > **Broadcom employees:** A pre-built VM OVA with the application already installed is available at:
 > [https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG](https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG)
-> Deploy the OVA and skip to [Step 6 — Verify](#step-6--verify).
+>
+> After deploying the OVA, use the built-in `net-config` script (run as root) to set the VM's IP address — switch between DHCP and static, or enter a static IP / subnet / gateway / DNS. See [Network Configuration Script](#network-configuration-script) for details.
+>
+> Then skip straight to [Step 6 — Verify](#step-6--verify).
 
 ---
 
@@ -28,8 +31,8 @@ This guide walks through deploying the **vSphere Supervisor Readiness Check + In
 
 ```bash
 apt-get update && apt-get install -y git
-git clone https://github.com/ddesmidt/Supervisor_Intall_Tool.git
-cd Supervisor_Intall_Tool
+git clone https://github.com/ddesmidt/Supervisor_Install_Tool.git
+cd Supervisor_Install_Tool
 ```
 
 ---
@@ -172,11 +175,11 @@ This uses `netplan` under the hood and applies changes immediately.
 After pulling new changes from the repo:
 
 ```bash
-cd Supervisor_Intall_Tool
+cd Supervisor_Install_Tool
 git pull
 
 cp app/app.py /opt/supervisor-check/app.py
-cp app/templates/index.html /opt/supervisor-check/templates/index.html
+cp app/templates/index_clarity.html /opt/supervisor-check/templates/index_clarity.html
 
 systemctl restart supervisor-check
 ```
