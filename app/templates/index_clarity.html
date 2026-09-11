@@ -1245,11 +1245,11 @@
                       <!-- NSX modes: active / greyed -->
                       <template x-if="showReqBtn && col.key !== 'vds_flb'">
                         <button
-                          :disabled="overallFor(col.key) === 'issues'"
-                          @click="overallFor(col.key) !== 'issues' && startInstallWizard(col.key)"
+                          :disabled="overallFor(col.key) !== 'ready'"
+                          @click="overallFor(col.key) === 'ready' && startInstallWizard(col.key)"
                           class="btn btn-sm"
-                          :class="overallFor(col.key) === 'issues' ? '' : 'btn-primary'"
-                          :style="overallFor(col.key) === 'issues' ? 'opacity:0.45; cursor:not-allowed; background:#dfe3e6; color:#6e777b; border:none;' : ''">
+                          :class="overallFor(col.key) === 'ready' ? 'btn-primary' : ''"
+                          :style="overallFor(col.key) !== 'ready' ? 'opacity:0.45; cursor:not-allowed; background:#dfe3e6; color:#6e777b; border:none;' : ''">
                           <i class="fas fa-rocket" style="font-size:0.68rem;"></i> Deploy
                         </button>
                       </template>
@@ -1509,30 +1509,30 @@
 
                 <div class="clr-form-control" style="margin-bottom:0.7rem;">
                   <label class="clr-control-label" style="font-size:0.68rem;">
-                    Management Port Group
-                    <span style="font-weight:normal; color:#6e777b;" x-text="'(' + (wizardDeployMode==='centralized' ? 'Centralized' : 'Distributed') + ')'"></span>
+                    Port Group (management VLAN)
                   </label>
                   <div class="clr-control-container"><div class="clr-select-wrapper">
-                    <select x-model="wizardConfig.port_group_id" class="clr-select">
+                    <select x-model="wizardConfig.port_group_id" class="clr-select"
+                            @change="wizardConfig.port_group_id !== ((wizardOptions && wizardOptions.vc_defaults && wizardOptions.vc_defaults.vc_pg_id) || '') && (wizardConfig.gateway_cidr = '')">
                       <option value="">— Select port group —</option>
                       <template x-for="pg in (wizardOptions ? wizardOptions.port_groups : [])" :key="pg.network">
                         <option :value="pg.network" x-text="pg.name + ' (' + pg.network + ')'"></option>
                       </template>
                     </select>
                   </div></div>
-                  <p x-show="wizardConfig.port_group_id && wizardConfig.port_group_name"
+                  <p x-show="wizardOptions && wizardOptions.vc_defaults && wizardOptions.vc_defaults.vc_pg_id && wizardConfig.port_group_id === wizardOptions.vc_defaults.vc_pg_id"
                      style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
                     <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
-                    Auto-discovered from <span x-text="wizardDeployMode==='centralized' ? 'Edge node' : 'VNA node'"></span>
+                    Auto-discovered from vCenter VM
                   </p>
                 </div>
 
                 <div class="clr-row">
                   <div class="clr-col-12 clr-col-md-6">
                     <div class="clr-form-control" style="margin-bottom:0.7rem;">
-                      <label class="clr-control-label" style="font-size:0.68rem;">First of 5 Control-Plane IPs</label>
+                      <label class="clr-control-label" style="font-size:0.68rem;">Supervisor Control-Plane Mgt IPs</label>
                       <div class="clr-control-container"><div class="clr-input-wrapper">
-                        <input type="text" x-model="wizardConfig.first_ip" placeholder="10.1.1.85-10.1.1.89" class="clr-input">
+                        <input type="text" x-model="wizardConfig.first_ip" placeholder="e.g. 10.1.1.85-10.1.1.89" class="clr-input">
                       </div></div>
                       <p style="font-size:0.62rem; color:#6e777b; margin-top:0.2rem;">Enter the first IP or the full range — 5 consecutive IPs will be reserved</p>
                     </div>
@@ -1541,7 +1541,7 @@
                     <div class="clr-form-control" style="margin-bottom:0.7rem;">
                       <label class="clr-control-label" style="font-size:0.68rem;">Gateway (IP/prefix)</label>
                       <div class="clr-control-container"><div class="clr-input-wrapper">
-                        <input type="text" x-model="wizardConfig.gateway_cidr" placeholder="10.1.1.1/24" class="clr-input">
+                        <input type="text" x-model="wizardConfig.gateway_cidr" placeholder="e.g. 10.x.x.1/24" class="clr-input">
                       </div></div>
                     </div>
                   </div>
@@ -1649,7 +1649,7 @@
                           ['NSX Project', wizardConfig.nsx_project_name],
                           ['VPC Profile', wizardConfig.vpc_profile_name],
                           ['Port Group', (wizardOptions ? (wizardOptions.port_groups.find(p=>p.network===wizardConfig.port_group_id)||{name:wizardConfig.port_group_id}).name : wizardConfig.port_group_id)],
-                          ['Control-Plane IPs', wizardConfig.first_ip + ' + 4 more (5 total)'],
+                          ['Supervisor Control-Plane Mgt IPs', wizardConfig.first_ip + ' (5 total)'],
                           ['Gateway', wizardConfig.gateway_cidr],
                           ['DNS', wizardConfig.dns_servers],
                           ['Search Domain', wizardConfig.search_domains],
@@ -1830,23 +1830,38 @@
         <!-- Step indicator -->
         <div x-show="vnaWizard.step >= 1 && vnaWizard.step <= 3"
              style="padding:0.9rem 1.2rem 0.5rem; border-bottom:1px solid #dfe3e6; flex-shrink:0;">
-          <div style="display:flex; align-items:center;">
-            <template x-for="(lbl, idx) in ['Node IPs','Network','Confirm']" :key="idx">
-              <div style="display:flex; align-items:center;" :style="idx<2 ? 'flex:1' : ''">
-                <div style="display:flex; flex-direction:column; align-items:center;">
-                  <div class="wiz-dot"
-                       :class="{ active: vnaWizard.step===idx+1, done: vnaWizard.step>idx+1, pending: vnaWizard.step<idx+1 }"
-                       x-text="vnaWizard.step > idx+1 ? '✓' : (idx+1)"></div>
-                  <span style="font-size:0.62rem; margin-top:0.18rem; white-space:nowrap;"
-                        :style="{ color: vnaWizard.step===idx+1 ? '#0072a3' : vnaWizard.step>idx+1 ? '#48960c' : '#6e777b' }"
-                        x-text="lbl"></span>
-                </div>
-                <template x-if="idx < 2">
-                  <div style="height:1px; flex:1; margin:0 0.4rem; margin-bottom:0.9rem;"
-                       :style="{ background: vnaWizard.step>idx+1 ? '#48960c' : '#dfe3e6' }"></div>
-                </template>
-              </div>
-            </template>
+          <!-- Stepper: 3 equal columns with connector lines between them -->
+          <div style="display:flex; align-items:flex-start;">
+            <!-- Step 1 -->
+            <div style="flex:1; display:flex; flex-direction:column; align-items:center;">
+              <div class="wiz-dot"
+                   :class="{ active: vnaWizard.step===1, done: vnaWizard.step>1, pending: vnaWizard.step<1 }"
+                   x-text="vnaWizard.step > 1 ? '✓' : '1'"></div>
+              <span style="font-size:0.62rem; margin-top:0.18rem; white-space:nowrap;"
+                    :style="{ color: vnaWizard.step===1 ? '#0072a3' : vnaWizard.step>1 ? '#48960c' : '#6e777b' }">Node IPs</span>
+            </div>
+            <!-- Connector 1→2 -->
+            <div style="flex:1; height:1px; margin-top:0.75rem;"
+                 :style="{ background: vnaWizard.step>1 ? '#48960c' : '#dfe3e6' }"></div>
+            <!-- Step 2 -->
+            <div style="flex:1; display:flex; flex-direction:column; align-items:center;">
+              <div class="wiz-dot"
+                   :class="{ active: vnaWizard.step===2, done: vnaWizard.step>2, pending: vnaWizard.step<2 }"
+                   x-text="vnaWizard.step > 2 ? '✓' : '2'"></div>
+              <span style="font-size:0.62rem; margin-top:0.18rem; white-space:nowrap;"
+                    :style="{ color: vnaWizard.step===2 ? '#0072a3' : vnaWizard.step>2 ? '#48960c' : '#6e777b' }">Network</span>
+            </div>
+            <!-- Connector 2→3 -->
+            <div style="flex:1; height:1px; margin-top:0.75rem;"
+                 :style="{ background: vnaWizard.step>2 ? '#48960c' : '#dfe3e6' }"></div>
+            <!-- Step 3 -->
+            <div style="flex:1; display:flex; flex-direction:column; align-items:center;">
+              <div class="wiz-dot"
+                   :class="{ active: vnaWizard.step===3, done: vnaWizard.step>3, pending: vnaWizard.step<3 }"
+                   x-text="vnaWizard.step > 3 ? '✓' : '3'"></div>
+              <span style="font-size:0.62rem; margin-top:0.18rem; white-space:nowrap;"
+                    :style="{ color: vnaWizard.step===3 ? '#0072a3' : vnaWizard.step>3 ? '#48960c' : '#6e777b' }">Confirm</span>
+            </div>
           </div>
         </div>
 
@@ -1882,6 +1897,11 @@
                 </template>
               </select>
             </div></div>
+            <p x-show="vnaWizard.options && vnaWizard.options.vm_mgmt_dvpg && vnaWizard.form.port_group_id === vnaWizard.options.vm_mgmt_dvpg"
+               style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
+              <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
+              Auto-discovered from vCenter VM
+            </p>
           </div>
 
           <div class="clr-row">
@@ -1889,7 +1909,7 @@
               <div class="clr-form-control" style="margin-bottom:0.75rem;">
                 <label class="clr-control-label" style="font-size:0.68rem;">Node 1 — Management IP</label>
                 <div class="clr-control-container"><div class="clr-input-wrapper">
-                  <input type="text" x-model="vnaWizard.form.ip1" placeholder="" class="clr-input">
+                  <input type="text" x-model="vnaWizard.form.ip1" placeholder="e.g. 10.1.1.178" class="clr-input">
                 </div></div>
               </div>
             </div>
@@ -1897,45 +1917,57 @@
               <div class="clr-form-control" style="margin-bottom:0.75rem;">
                 <label class="clr-control-label" style="font-size:0.68rem;">Node 2 — Management IP</label>
                 <div class="clr-control-container"><div class="clr-input-wrapper">
-                  <input type="text" x-model="vnaWizard.form.ip2" placeholder="" class="clr-input">
+                  <input type="text" x-model="vnaWizard.form.ip2" placeholder="e.g. 10.1.1.179" class="clr-input">
                 </div></div>
               </div>
             </div>
           </div>
 
-          <template x-if="vnaWizard.options && (vnaWizard.options.clusters || []).length === 1">
-            <div style="font-size:0.72rem; color:#6e777b; background:#f3f6fa; border-radius:3px; padding:0.5rem 0.75rem; margin-bottom:0.5rem;">
-              <i class="fas fa-info-circle" style="color:#0072a3; margin-right:0.25rem;"></i>
-              vSphere cluster: <strong x-text="vnaWizard.options.clusters[0].name"></strong>
-              &nbsp;·&nbsp; Datastore: <strong x-text="(vnaWizard.options.datastores || [])[0] && (vnaWizard.options.datastores[0].name || '(auto)')"></strong>
-            </div>
-          </template>
-          <template x-if="vnaWizard.options && (vnaWizard.options.clusters || []).length > 1">
-            <div class="clr-form-control" style="margin-bottom:0.75rem;">
-              <label class="clr-control-label" style="font-size:0.68rem;">vSphere Cluster (for VNA deployment)</label>
-              <div class="clr-control-container"><div class="clr-select-wrapper">
-                <select x-model="vnaWizard.form.cluster_moref" class="clr-select">
-                  <template x-for="c in vnaWizard.options.clusters" :key="c.cluster">
-                    <option :value="c.cluster" x-text="c.name"></option>
-                  </template>
-                </select>
-              </div></div>
-            </div>
-          </template>
+          <!-- vSphere Cluster — always a dropdown, first cluster pre-selected -->
+          <div class="clr-form-control" style="margin-bottom:0.75rem;">
+            <label class="clr-control-label" style="font-size:0.68rem;">vSphere Cluster</label>
+            <div class="clr-control-container"><div class="clr-select-wrapper">
+              <select x-model="vnaWizard.form.cluster_moref" class="clr-select">
+                <template x-for="c in (vnaWizard.options ? vnaWizard.options.clusters : [])" :key="c.cluster">
+                  <option :value="c.cluster" x-text="c.name"></option>
+                </template>
+              </select>
+            </div></div>
+          </div>
+
+          <!-- Datastore — always a dropdown, pre-selected to most free space -->
+          <div class="clr-form-control" style="margin-bottom:0.75rem;">
+            <label class="clr-control-label" style="font-size:0.68rem;">Datastore</label>
+            <div class="clr-control-container"><div class="clr-select-wrapper">
+              <select x-model="vnaWizard.form.datastore_id" class="clr-select">
+                <template x-for="ds in (vnaWizard.options ? vnaWizard.options.datastores : [])" :key="ds.datastore">
+                  <option :value="ds.datastore"
+                    x-text="ds.name + (ds.free_space ? ' — ' + Math.round(ds.free_space/1073741824) + ' GB free' : '')">
+                  </option>
+                </template>
+              </select>
+            </div></div>
+          </div>
 
         </div>
 
         <!-- Step 2: Network Settings -->
         <div x-show="vnaWizard.step === 2" class="modal-body" style="flex:1;">
-          <div class="alert alert-warning alert-sm" style="margin-bottom:0.75rem;">
+
+          <!-- Corner-case: same VDS Port Group as vCenter but IPs from a different subnet -->
+          <div x-show="vnaWizard.options && vnaWizard.form.port_group_id === vnaWizard.options.vm_mgmt_dvpg && !vnaIpsSameSubnet()"
+               class="alert alert-warning alert-sm" style="margin-bottom:0.9rem;">
             <div class="alert-items"><div class="alert-item static">
+              <clr-icon shape="warning-standard" class="alert-icon"></clr-icon>
               <span class="alert-text">
-                These IPs are not in the vCenter management subnet
+                The VNA Nodes will be plugged in the same VDS Port Group as vCenter,
+                but their IPs are not in the vCenter management subnet
                 (<span style="font-family:monospace;" x-text="vnaWizard.options && vnaWizard.options.vc_subnet"></span>).
-                Please provide the network settings for this subnet.
+                Are you really sure?
               </span>
             </div></div>
           </div>
+
           <div class="clr-row">
             <div class="clr-col-6">
               <div class="clr-form-control" style="margin-bottom:0.75rem;">
@@ -1949,7 +1981,7 @@
               <div class="clr-form-control" style="margin-bottom:0.75rem;">
                 <label class="clr-control-label" style="font-size:0.68rem;">Default Gateway</label>
                 <div class="clr-control-container"><div class="clr-input-wrapper">
-                  <input type="text" x-model="vnaWizard.form.gateway" placeholder="10.x.x.1" class="clr-input">
+                  <input type="text" x-model="vnaWizard.form.gateway" placeholder="e.g. 10.1.1.1" class="clr-input">
                 </div></div>
               </div>
             </div>
@@ -1979,7 +2011,7 @@
             ['DNS',         vnaEffectiveDns()],
             ['NTP',         vnaEffectiveNtp()],
             ['vSphere Cluster', (vnaWizard.options && (vnaWizard.options.clusters||[]).find(c=>c.cluster===(vnaWizard.form.cluster_moref||(vnaWizard.options.clusters[0]&&vnaWizard.options.clusters[0].cluster)))||{}).name||'(auto)'],
-            ['Datastore',   ((vnaWizard.options && vnaWizard.options.datastores||[])[0]||{}).name||'(auto)'],
+            ['Datastore',   (vnaWizard.options && (vnaWizard.options.datastores||[]).find(d=>d.datastore===vnaWizard.form.datastore_id)||{}).name||'(auto)'],
           ]" :key="k">
             <div style="display:flex; justify-content:space-between; font-size:0.8rem; border-bottom:1px solid #dfe3e6; padding:0.45rem 0;">
               <span style="color:#6e777b; flex-shrink:0; width:7rem;" x-text="k"></span>
@@ -2054,14 +2086,15 @@
 
         <!-- VNA Footer -->
         <div class="modal-footer" style="flex-shrink:0;">
-          <button @click="vnaWizard.step > 1 && vnaWizard.step < 4 ? vnaWizard.step-- : vnaWizard.show = false"
-                  :disabled="vnaWizard.step === 4 && !vnaWizard.result"
+          <button x-show="vnaWizard.step < 4"
+                  @click="vnaWizard.step > 1 ? vnaWizard.step-- : vnaWizard.show = false"
                   class="btn btn-outline btn-sm">
-            <span x-text="(vnaWizard.step>1 && vnaWizard.step<4) ? '← Back' : 'Cancel'"></span>
+            <span x-text="vnaWizard.step > 1 ? '← Back' : 'Cancel'"></span>
           </button>
           <button x-show="vnaWizard.step === 1 || vnaWizard.step === 2"
                   @click="vnaNext()"
-                  :disabled="vnaWizard.step === 1 && !vnaStep1Valid()"
+                  :disabled="(vnaWizard.step === 1 && !vnaStep1Valid()) ||
+                             (vnaWizard.step === 2 && !vnaIpsSameSubnet() && !vnaWizard.form.gateway)"
                   class="btn btn-primary btn-sm">
             Next →
           </button>
@@ -2071,9 +2104,11 @@
             <i :class="vnaWizard.loading ? 'fas fa-circle-notch fa-spin' : 'fas fa-rocket'"></i>
             Deploy VNA Cluster
           </button>
-          <button x-show="vnaWizard.step === 4 && vnaWizard.result"
-                  @click="vnaWizard.show = false"
-                  class="btn btn-outline btn-sm">Close</button>
+          <button x-show="vnaWizard.step === 4"
+                  @click="vnaWizard.show = false; checkRequirements()"
+                  class="btn btn-success btn-sm">
+            <i class="fas fa-sync-alt" style="margin-right:0.35rem;"></i>Re-Check Requirements
+          </button>
         </div>
 
       </div>
@@ -2804,7 +2839,13 @@
 
         <!-- Fix Modal Footer -->
         <div class="modal-footer" style="flex-shrink:0;">
-          <button @click="fixModal.show = false" class="btn btn-outline btn-sm">Cancel</button>
+          <!-- Cancel: hidden whenever a Re-Check button is shown -->
+          <button x-show="!(
+              (fixModal.step === 2 && fixModal.type === 's5-1d' && fixModal.result && fixModal.result.success && (!fixModal.cascade || !fixModal.cascade.enabled)) ||
+              (fixModal.step === 2 && fixModal.type === 's5-1d' && fixModal.cascade && fixModal.cascade.done && fixModal.cascade.steps.every(s => s.status === 'success' || s.status === 'skipped')) ||
+              (fixModal.step === 2 && fixModal.type !== 's5-1d' && fixModal.result && fixModal.result.success)
+            )"
+                  @click="fixModal.show = false" class="btn btn-outline btn-sm">Cancel</button>
           <div style="display:flex; gap:0.45rem;">
             <button x-show="fixModal.step === 1"
                     @click="fixApply()"
@@ -2812,11 +2853,17 @@
                     class="btn btn-warning btn-sm">
               <i class="fas fa-wrench"></i> Apply Fix
             </button>
+            <!-- s5-1d standalone (no cascade): S5-1 succeeded -->
+            <button x-show="fixModal.step === 2 && fixModal.type === 's5-1d' && fixModal.result && fixModal.result.success && (!fixModal.cascade || !fixModal.cascade.enabled)"
+                    @click="fixModal.show = false; checkRequirements()"
+                    class="btn btn-success btn-sm">
+              <i class="fas fa-sync-alt" style="margin-right:0.3rem;"></i>Re-Check Requirements
+            </button>
             <!-- Cascade (s5-1d): show Re-check when done (all success or some skipped, no failures) -->
             <button x-show="fixModal.step === 2 && fixModal.type === 's5-1d' && fixModal.cascade && fixModal.cascade.done && fixModal.cascade.steps.every(s => s.status === 'success' || s.status === 'skipped')"
                     @click="fixModal.show = false; checkRequirements()"
                     class="btn btn-success btn-sm">
-              <i class="fas fa-sync-alt"></i> Re-check Requirements
+              <i class="fas fa-sync-alt" style="margin-right:0.3rem;"></i>Re-Check Requirements
             </button>
             <!-- Cascade (s5-1d): Back to Form when S5-1 itself failed -->
             <button x-show="fixModal.step === 2 && fixModal.type === 's5-1d' && fixModal.result && !fixModal.result.success"
@@ -2828,7 +2875,7 @@
             <button x-show="fixModal.step === 2 && fixModal.type !== 's5-1d' && fixModal.result && fixModal.result.success"
                     @click="fixModal.show = false; checkRequirements()"
                     class="btn btn-success btn-sm">
-              <i class="fas fa-sync-alt"></i> Re-check Requirements
+              <i class="fas fa-sync-alt" style="margin-right:0.3rem;"></i>Re-Check Requirements
             </button>
             <!-- Standard (non-cascade): failure -->
             <button x-show="fixModal.step === 2 && fixModal.type !== 's5-1d' && fixModal.result && !fixModal.result.success"
@@ -4456,18 +4503,23 @@
               this.wizardConfig.cluster_moref = clusters[0].cluster;
               this.wizardConfig.cluster_name  = clusters[0].name;
             }
-            // Prefer node-derived defaults (VNA for distributed, Edge for centralized)
-            // over vCenter appliance defaults — smarter for workload domains.
             const dMode = this.wizardDeployMode || 'distributed';
             const nodeD = (d.node_defaults || {})[dMode] || null;
             const vcD   = d.vc_defaults || {};
+
+            // Port Group: pre-select ONLY when vCenter VM is found in THIS vCenter
+            // (vc_pg_id is populated by backend only in that case)
+            const vcPgId = vcD.vc_pg_id || '';
+            if (vcPgId) {
+              this.wizardConfig.port_group_id   = vcPgId;
+              this.wizardConfig.port_group_name = (d.port_groups || []).find(pg => pg.network === vcPgId)?.name || vcPgId;
+              // Gateway known because we know vCenter is on this PG
+              if (vcD.gateway) this.wizardConfig.gateway_cidr = vcD.gateway;
+            }
+            // else: port_group_id and gateway_cidr stay blank
+
+            // DNS / NTP / Search Domain: prefer VNA/Edge node (NSX-sourced), fallback to vCenter appliance
             if (nodeD) {
-              if (nodeD.pg_id) {
-                this.wizardConfig.port_group_id   = nodeD.pg_id;
-                this.wizardConfig.port_group_name = nodeD.pg_name || nodeD.pg_id;
-              }
-              if (nodeD.gateway_cidr)
-                this.wizardConfig.gateway_cidr = nodeD.gateway_cidr;
               if (nodeD.dns && nodeD.dns.length)
                 this.wizardConfig.dns_servers = nodeD.dns.join(', ');
               if (nodeD.ntp && nodeD.ntp.length)
@@ -4475,15 +4527,12 @@
               if (nodeD.search_domain)
                 this.wizardConfig.search_domains = nodeD.search_domain;
             } else {
-              // Fallback to vCenter appliance values
               if (vcD.dns_servers && vcD.dns_servers.length)
                 this.wizardConfig.dns_servers = vcD.dns_servers.join(', ');
               if (vcD.search_domains && vcD.search_domains.length)
                 this.wizardConfig.search_domains = vcD.search_domains.join(', ');
               if (vcD.ntp_servers && vcD.ntp_servers.length)
                 this.wizardConfig.ntp_servers = vcD.ntp_servers.join(', ');
-              if (vcD.gateway)
-                this.wizardConfig.gateway_cidr = vcD.gateway;
             }
             // Suggest name from vCenter hostname
             const host = this.form.vc_url.replace(/^https?:\/\//, '').split('.')[0];
@@ -4867,7 +4916,8 @@
               const ecs = d.edge_clusters || [];
               if (ecs.length > 0) this.fixModal.form.edge_cluster_path = ecs[0].path;
             }
-            if (step === '5-2' && mode === 'distributed') {
+            // Shared helper: resolve which dvlan connection is attached to the TGW and pre-fill CIDR
+            const _applyDvlanFromOptions = () => {
               const dvlans = d.dvlan_connections || [];
               let dvlanUsed = dvlans[0];
               if (d.tgw_attachments && d.tgw_attachments.length > 0) {
@@ -4875,11 +4925,18 @@
                 const matched = dvlans.find(c => c.path === tgwConnPath);
                 if (matched) dvlanUsed = matched;
               }
-              this.fixModal.form.dvlan_list    = dvlans;
+              this.fixModal.form.dvlan_list     = dvlans;
               this.fixModal.form.dvlan_sel_path = dvlanUsed ? (dvlanUsed.path || dvlanUsed.id || '') : '';
-              this.fixModal.form.tgw_name      = (d.tgw && (d.tgw.name || d.tgw.id)) || 'Default Transit Gateway';
+              this.fixModal.form.tgw_name       = (d.tgw && (d.tgw.name || d.tgw.id)) || 'Default Transit Gateway';
               this.fixModal.form.excluded_ranges = '';
               this._applyDvlanSelection(dvlanUsed);
+            };
+
+            if (step === '5-2' && mode === 'distributed') {
+              _applyDvlanFromOptions();
+            }
+            if (step === '5-3' && mode === 'distributed') {
+              _applyDvlanFromOptions();   // pre-fills CIDR from the attached dvlan connection
             }
             if (step === '5-4') {
               const extBlocks = mode === 'centralized'
@@ -5385,7 +5442,7 @@
       vnaEffectivePrefix()  {
         return this.vnaIpsSameSubnet()
           ? (this.vnaWizard.options && this.vnaWizard.options.vc_prefix) || 24
-          : this.vnaWizard.form.prefix;
+          : (this.vnaWizard.form.prefix || 24);   // honour placeholder default of /24
       },
       vnaEffectiveGateway() {
         return this.vnaIpsSameSubnet()
@@ -5404,11 +5461,14 @@
       },
 
       vnaNext() {
-        if (this.vnaWizard.step === 1) {
-          this.vnaWizard.step = this.vnaIpsSameSubnet() ? 3 : 2;
-        } else {
-          this.vnaWizard.step++;
+        // When leaving Step 1 with IPs on a different subnet, clear prefix & gateway
+        // so the user must enter the correct values for that subnet.
+        // DNS/NTP stay pre-filled (usually the same across subnets).
+        if (this.vnaWizard.step === 1 && !this.vnaIpsSameSubnet()) {
+          this.vnaWizard.form.prefix  = '';
+          this.vnaWizard.form.gateway = '';
         }
+        this.vnaWizard.step++;
       },
 
       async vnaCreate() {

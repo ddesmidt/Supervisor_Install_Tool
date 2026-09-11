@@ -1107,6 +1107,7 @@ def discover_install_options():
         "vc_defaults": {
             "gateway": "", "prefix": 24, "dns_servers": [],
             "search_domains": [], "ntp_servers": [],
+            "vc_pg_id": "",   # port group of the vCenter VM (empty if not found in this VC)
         },
         "node_defaults": {},
         "nsx_project_path": "/orgs/default/projects/default",
@@ -1127,6 +1128,29 @@ def discover_install_options():
             vc_get(vc_url, token, "/api/vcenter/network",
                    params={"types": "DISTRIBUTED_PORTGROUP"}) or []
         )
+
+        # Find vCenter VM's port group: pre-select in deploy wizard only when
+        # the vCenter VM is registered in THIS vCenter (not for workload-domain VCs).
+        # Note: filter.names query param is unsupported on some vCenter versions,
+        # so we list all VMs and match by name.
+        try:
+            _vc_short = (urlparse(vc_url).hostname or "").split(".")[0].lower()
+            _all_vms  = vc_get(vc_url, token, "/api/vcenter/vm") or []
+            _vc_vm    = next((v for v in _all_vms
+                              if (v.get("name") or "").lower() == _vc_short), None)
+            if _vc_vm:
+                _vm_id = _vc_vm.get("vm", "")
+                _nics  = vc_get(vc_url, token,
+                                f"/api/vcenter/vm/{_vm_id}/hardware/ethernet") or [] if _vm_id else []
+                if _nics:
+                    _nic0     = _nics[0].get("nic", "")
+                    _nic_data = vc_get(vc_url, token,
+                                      f"/api/vcenter/vm/{_vm_id}/hardware/ethernet/{_nic0}") if _nic0 else {}
+                    _pg = ((_nic_data or {}).get("backing") or {}).get("network", "")
+                    if _pg:
+                        result["vc_defaults"]["vc_pg_id"] = _pg
+        except Exception:
+            pass
 
         # vCenter appliance network defaults
         try:
@@ -2491,7 +2515,13 @@ def fix_vna_options():
                 prefix = ipv4.get("prefix", 24)
                 gw     = ipv4.get("default_gateway", "")
                 if vc_ip and gw:
-                    result["vc_subnet"]  = f"{vc_ip}/{prefix}"
+                    # Compute proper network address (e.g. 10.1.1.0/24, not 10.1.1.10/24)
+                    try:
+                        import ipaddress
+                        net = ipaddress.IPv4Network(f"{vc_ip}/{prefix}", strict=False)
+                        result["vc_subnet"] = str(net)          # "10.1.1.0/24"
+                    except Exception:
+                        result["vc_subnet"] = f"{vc_ip}/{prefix}"
                     result["vc_gateway"] = gw
                     result["vc_prefix"]  = prefix
                     break
@@ -4321,8 +4351,9 @@ def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, 
             Start-Sleep -Seconds 3""")
 
     script = textwrap.dedent(f"""\
+        $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $ErrorActionPreference = 'SilentlyContinue'
-        Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false | Out-Null
+        Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
         Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
         $ErrorActionPreference = 'Stop'
         Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
@@ -4335,13 +4366,16 @@ def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, 
     with tempfile.NamedTemporaryFile(suffix=".ps1", mode="w", delete=False, prefix="vcf_setup_") as f:
         f.write(script); script_path = f.name
     try:
-        r = subprocess.run(["pwsh", "-NonInteractive", "-File", script_path],
-                           capture_output=True, text=True, timeout=150)
+        env = os.environ.copy()
+        env["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"   # fixes CoreServiceFactory on Ubuntu 24.04
+        env.setdefault("HOME", "/root")                      # ensure pwsh can write its config
+        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
+                           capture_output=True, text=True, timeout=150, env=env)
         out = r.stdout + r.stderr
         # Strip ANSI escape codes so error messages are readable
         out = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', out)
         if "PCLI_SETUP_DONE" not in out:
-            return {}, False, f"PowerCLI setup failed (no DONE marker):\n{out[:800]}"
+            return {}, False, f"PowerCLI setup failed (no DONE marker):\n{out[:2000]}"
         pg_created = "PG:CREATED:" in out
         vmk_map = {}
         for line in out.splitlines():
@@ -4365,8 +4399,9 @@ def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns):
     vc_host = vc_url.replace("https://", "").replace("http://", "").rstrip("/")
     host_array = ", ".join(f"\'{h}\'" for h in host_fqdns)
     script = textwrap.dedent(f"""\
+        $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $ErrorActionPreference = 'SilentlyContinue'
-        Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false | Out-Null
+        Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
         Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
         Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
         $pg = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue
@@ -4384,8 +4419,11 @@ def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns):
     with tempfile.NamedTemporaryFile(suffix=".ps1", mode="w", delete=False, prefix="vcf_cleanup_") as f:
         f.write(script); script_path = f.name
     try:
-        subprocess.run(["pwsh", "-NonInteractive", "-File", script_path],
-                       capture_output=True, text=True, timeout=90)
+        _env2 = os.environ.copy()
+        _env2["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"
+        _env2.setdefault("HOME", "/root")
+        subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
+                       capture_output=True, text=True, timeout=90, env=_env2)
     except Exception:
         pass
     finally:
