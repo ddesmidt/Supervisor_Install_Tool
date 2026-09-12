@@ -17,17 +17,23 @@ It supports all three vSphere Supervisor deployment modes:
 
 | Mode | Description |
 |---|---|
-| **NSX-VPC Distributed** ⭐ | Recommended. VNA cluster handles overlay networking — no Edge Node / Tier-0 / BGP required |
-| **NSX-VPC Centralized** | Requires Edge Cluster + Tier-0 + BGP |
-| **VDS / FLB** | Legacy mode — no NSX required but limited network services |
+| **NSX-VPC Distributed** ⭐ | Recommended. No Edge Node / Tier-0 / BGP.<br>*Note: L2 requirements on all ESX* |
+| **NSX-VPC Centralized** | Requires Edge Cluster + Tier-0 + BGP.<br>*Note: No L2 requirements on all ESX* |
+| **VDS / FLB** | No NSX required but limited network services.<br>*Note: L2 requirements on all ESX* |
 
-In addition to the prerequisite checks, the tool offers three deeper validation tests:
+In addition to the prerequisite checks, the tool offers three deeper validation tests prior to the Supervisor deployment:
 
 | Check | Modes | What it verifies |
 |---|---|---|
 | **Check MTU** | VPC-Dist. · VPC-Cent. | Validates ESX tunnels support large MTU packets end-to-end |
 | **Check Ext. Conn.** | VPC-Dist. | Validates each ESX has access to the Ext. Conn. VLAN, and scans the physical fabric to validate all IP addresses in the External IP Block are not already in use and so well available for Supervisor |
 | **Check DNS Connectivity** | VPC-Dist. · VPC-Cent. | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
+
+Finally, the tool offers one deeper validation test post Supervisor and VKS deployment:
+
+| Check | Modes | What it verifies |
+|---|---|---|
+| **Connectivity Test** | VPC-Dist. · VPC-Cent. | Validates the cross communication between Supervisor and VKS |
 
 ---
 
