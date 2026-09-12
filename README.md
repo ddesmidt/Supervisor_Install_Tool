@@ -18,7 +18,7 @@ In addition to the prerequisite checks, the tool offers three deeper validation 
 | Check | What it verifies |
 |---|---|
 | **Check Ext. Conn.** | End-to-end VLAN connectivity on every ESX host — creates a temporary VMkernel adapter, pings the upstream gateway, and scans the External IP Block for conflicts |
-| **Check IP Availability** | Scans the External IP Block for IPs already in use (excluding IPs already allocated by NSX VPC), and shows available ranges |
+| **Check IP Availability** | Scans the physical fabric to validate the External IP Block are not already in use and so well available for Supervisor |
 | **Check DNS Connectivity** | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
 
 It supports all three vSphere Supervisor deployment modes:
