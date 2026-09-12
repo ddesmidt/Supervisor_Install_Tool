@@ -13,6 +13,14 @@ The tool is a self-hosted Flask web app deployed on a VM inside your VCF environ
 3. **Automatically fix missing prerequisites** via guided wizards
 4. **Deploy Supervisor** once all requirements are met
 
+In addition to the prerequisite checks, the tool offers three deeper validation tests:
+
+| Check | What it verifies |
+|---|---|
+| **Check Ext. Conn.** | End-to-end VLAN connectivity on every ESX host — creates a temporary VMkernel adapter, pings the upstream gateway, and scans the External IP Block for conflicts |
+| **Check IP Availability** | Scans the External IP Block for IPs already in use (excluding IPs already allocated by NSX VPC), and shows available ranges |
+| **Check DNS Connectivity** | Verifies that the DNS servers configured for Supervisor can resolve expected hostnames from the Supervisor nodes |
+
 It supports all three vSphere Supervisor deployment modes:
 
 | Mode | Description |
