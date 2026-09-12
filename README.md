@@ -13,14 +13,6 @@ The tool is a self-hosted Flask web app deployed on a VM inside your VCF environ
 3. **Automatically fix missing prerequisites** via guided wizards
 4. **Deploy Supervisor** once all requirements are met
 
-In addition to the prerequisite checks, the tool offers three deeper validation tests:
-
-| Check | Modes | What it verifies |
-|---|---|---|
-| **Check MTU** | VPC-Dist. · VPC-Cent. | Validates ESX tunnels support large MTU packets end-to-end |
-| **Check Ext. Conn.** | VPC-Dist. | Validates each ESX has access to the Ext. Conn. VLAN, and scans the physical fabric to validate all IP addresses in the External IP Block are not already in use and so well available for Supervisor |
-| **Check DNS Connectivity** | VPC-Dist. · VPC-Cent. | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
-
 It supports all three vSphere Supervisor deployment modes:
 
 | Mode | Description |
@@ -28,6 +20,14 @@ It supports all three vSphere Supervisor deployment modes:
 | **NSX-VPC Distributed** ⭐ | Recommended. VNA cluster handles overlay networking — no Edge Node / Tier-0 / BGP required |
 | **NSX-VPC Centralized** | Requires Edge Cluster + Tier-0 + BGP |
 | **VDS / FLB** | Legacy mode — no NSX required but limited network services |
+
+In addition to the prerequisite checks, the tool offers three deeper validation tests:
+
+| Check | Modes | What it verifies |
+|---|---|---|
+| **Check MTU** | VPC-Dist. · VPC-Cent. | Validates ESX tunnels support large MTU packets end-to-end |
+| **Check Ext. Conn.** | VPC-Dist. | Validates each ESX has access to the Ext. Conn. VLAN, and scans the physical fabric to validate all IP addresses in the External IP Block are not already in use and so well available for Supervisor |
+| **Check DNS Connectivity** | VPC-Dist. · VPC-Cent. | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
 
 ---
 
