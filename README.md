@@ -15,11 +15,11 @@ The tool is a self-hosted Flask web app deployed on a VM inside your VCF environ
 
 In addition to the prerequisite checks, the tool offers three deeper validation tests:
 
-| Check | What it verifies |
-|---|---|
-| **Check Ext. Conn.** | End-to-end VLAN connectivity on every ESX host — creates a temporary VMkernel adapter, pings the upstream gateway, and scans the External IP Block for conflicts |
-| **Check IP Availability** | Scans the physical fabric to validate the External IP Block are not already in use and so well available for Supervisor |
-| **Check DNS Connectivity** | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
+| Check | Modes | What it verifies |
+|---|---|---|
+| **Check MTU** | VPC-Dist. · VPC-Cent. | Validates ESX tunnels support large MTU packets end-to-end |
+| **Check Ext. Conn.** | VPC-Dist. | Validates each ESX has access to the Ext. Conn. VLAN, and scans the physical fabric to validate all IP addresses in the External IP Block are not already in use and so well available for Supervisor |
+| **Check DNS Connectivity** | VPC-Dist. · VPC-Cent. | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
 
 It supports all three vSphere Supervisor deployment modes:
 
