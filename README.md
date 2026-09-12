@@ -24,16 +24,16 @@ It supports all three vSphere Supervisor deployment modes:
 In addition to the prerequisite checks, the tool offers three deeper validation tests prior to the Supervisor deployment:
 
 | Check | Modes | What it verifies |
-|---|---|---|
-| **Check MTU** | VPC-Dist. · VPC-Cent. | Validates ESX tunnels support large MTU packets end-to-end |
-| **Check Ext. Conn.** | VPC-Dist. | Validates each ESX has access to the Ext. Conn. VLAN, and scans the physical fabric to validate all IP addresses in the External IP Block are not already in use and so well available for Supervisor |
-| **Check DNS Connectivity** | VPC-Dist. · VPC-Cent. | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
+|:--|:--:|:--|
+| **Check MTU** | VPC-Dist. ·<br>VPC-Cent. | Validates ESX tunnels support large MTU packets end-to-end |
+| **Check Ext. Connectivity** | VPC-Dist. | Validates each ESX has access to the Ext. Conn. VLAN, and scans the physical fabric to validate all IP addresses in the External IP Block are not already in use and so well available for Supervisor |
+| **Check DNS Connectivity** | VPC-Dist. ·<br>VPC-Cent. | Verifies that the future Supervisor VM will have connectivity to the configured DNS servers |
 
 Finally, the tool offers one deeper validation test post Supervisor and VKS deployment:
 
 | Check | Modes | What it verifies |
-|---|---|---|
-| **Connectivity Test** | VPC-Dist. · VPC-Cent. | Validates the cross communication between Supervisor and VKS |
+|:--|:--:|:--|
+| **Sup / VKS Connectivity Test** | VPC-Dist. ·<br>VPC-Cent. | Validates the cross communication between Supervisor and VKS |
 
 ---
 
