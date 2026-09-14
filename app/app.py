@@ -1129,15 +1129,80 @@ def discover_install_options():
                    params={"types": "DISTRIBUTED_PORTGROUP"}) or []
         )
 
-        # Find vCenter VM's port group: pre-select in deploy wizard only when
-        # the vCenter VM is registered in THIS vCenter (not for workload-domain VCs).
-        # Note: filter.names query param is unsupported on some vCenter versions,
-        # so we list all VMs and match by name.
+        # Get the vCenter appliance's own IP and gateway from /api/appliance/networking
+        # (this works whether the user connected by FQDN or by IP).
+        _vc_own_ip = ""
         try:
-            _vc_short = (urlparse(vc_url).hostname or "").split(".")[0].lower()
-            _all_vms  = vc_get(vc_url, token, "/api/vcenter/vm") or []
-            _vc_vm    = next((v for v in _all_vms
-                              if (v.get("name") or "").lower() == _vc_short), None)
+            _net = vc_get(vc_url, token, "/api/appliance/networking") or {}
+            _ifaces_map = _net.get("interfaces", {}) if isinstance(_net, dict) else {}
+            for _idata in _ifaces_map.values():
+                _ipv4 = _idata.get("ipv4", {}) or {}
+                _addr = _ipv4.get("address", "")
+                _gw   = _ipv4.get("default_gateway", "")
+                _pfx  = _ipv4.get("prefix", 24)
+                if _addr:
+                    _vc_own_ip = _addr
+                if _gw and not result["vc_defaults"]["gateway"]:
+                    result["vc_defaults"]["gateway"] = f"{_gw}/{_pfx}"
+                    result["vc_defaults"]["prefix"]  = _pfx
+                if _vc_own_ip:
+                    break
+        except Exception:
+            pass
+
+        # For gateway/prefix fallback via the older interfaces API
+        if not result["vc_defaults"]["gateway"]:
+            try:
+                ifaces = vc_get(vc_url, token, "/api/appliance/networking/interfaces") or []
+                for iface in (ifaces if isinstance(ifaces, list) else []):
+                    ipv4 = iface.get("ipv4") or {}
+                    gw = ipv4.get("default_gateway", "")
+                    prefix = ipv4.get("prefix", 24)
+                    if gw:
+                        result["vc_defaults"]["gateway"] = f"{gw}/{prefix}"
+                        result["vc_defaults"]["prefix"] = prefix
+                        break
+            except Exception:
+                pass
+
+        # Determine the vCenter short name for VM lookup:
+        # - if the user typed a FQDN, extract the first label directly
+        # - if the user typed an IP, _url_host is numeric → short name would be wrong,
+        #   so we rely solely on the guest-IP match below
+        _url_host = (urlparse(vc_url).hostname or "")
+        _url_is_ip = all(p.isdigit() for p in _url_host.split(".") if p)
+        _vc_short  = "" if _url_is_ip else _url_host.split(".")[0].lower()
+
+        # Find vCenter VM's port group by:
+        #   1. Name match  (FQDN input: match "vc-mgmt-a" from the URL)
+        #   2. Guest IP match (IP input: find which VM's IP equals the vCenter IP we connected to)
+        try:
+            _all_vms = vc_get(vc_url, token, "/api/vcenter/vm") or []
+            _vc_vm   = None
+
+            # Strategy 1 — name match
+            if _vc_short:
+                _vc_vm = next((v for v in _all_vms
+                               if (v.get("name") or "").lower() == _vc_short), None)
+
+            # Strategy 2 — guest IP match (used when URL was an IP)
+            if not _vc_vm and _vc_own_ip:
+                for _v in _all_vms:
+                    _vid = _v.get("vm", "")
+                    if not _vid:
+                        continue
+                    _guest = vc_get(vc_url, token,
+                                    f"/api/vcenter/vm/{_vid}/guest/networking/interfaces") or []
+                    for _giface in (_guest if isinstance(_guest, list) else []):
+                        for _gaddr in (_giface.get("ip", {}) or {}).get("ip_addresses", []):
+                            if _gaddr.get("ip_address") == _vc_own_ip:
+                                _vc_vm = _v
+                                break
+                        if _vc_vm:
+                            break
+                    if _vc_vm:
+                        break
+
             if _vc_vm:
                 _vm_id = _vc_vm.get("vm", "")
                 _nics  = vc_get(vc_url, token,
@@ -1149,30 +1214,31 @@ def discover_install_options():
                     _pg = ((_nic_data or {}).get("backing") or {}).get("network", "")
                     if _pg:
                         result["vc_defaults"]["vc_pg_id"] = _pg
-        except Exception:
-            pass
-
-        # vCenter appliance network defaults
-        try:
-            ifaces = vc_get(vc_url, token, "/api/appliance/networking/interfaces") or []
-            for iface in (ifaces if isinstance(ifaces, list) else []):
-                ipv4 = iface.get("ipv4") or {}
-                gw = ipv4.get("default_gateway", "")
-                prefix = ipv4.get("prefix", 24)
-                if gw:
-                    result["vc_defaults"]["gateway"] = f"{gw}/{prefix}"
-                    result["vc_defaults"]["prefix"] = prefix
-                    break
+                # Also derive the short name from the found VM (for search domain)
+                if _url_is_ip and not _vc_short:
+                    _vc_short = (_vc_vm.get("name") or "").split(".")[0].lower()
         except Exception:
             pass
 
         try:
             dns = vc_get(vc_url, token, "/api/appliance/networking/dns/servers") or {}
             result["vc_defaults"]["dns_servers"] = dns.get("servers", [])
-            p = urlparse(vc_url)
-            host_parts = (p.hostname or "").split(".")
-            if len(host_parts) >= 3:
-                result["vc_defaults"]["search_domains"] = [".".join(host_parts[1:])]
+            # Derive search domain from the resolved short name → need the FQDN
+            # Try the found VM name first, then fall back to parsing the NSX URL
+            _domain_src = ""
+            if _vc_short and "." not in _vc_short:
+                # We have the short name but not the full domain; try NSX URL as source
+                _nsx_host = (urlparse(nsx_url).hostname or "") if nsx_url else ""
+                _nsx_parts = _nsx_host.split(".")
+                if len(_nsx_parts) >= 3 and not _nsx_parts[0].replace("-","").isdigit():
+                    _domain_src = ".".join(_nsx_parts[1:])   # "site-a.vcf.lab"
+            else:
+                # URL was a FQDN like "vc-mgmt-a.site-a.vcf.lab"
+                _parts = _url_host.split(".")
+                if len(_parts) >= 3:
+                    _domain_src = ".".join(_parts[1:])
+            if _domain_src:
+                result["vc_defaults"]["search_domains"] = [_domain_src]
         except Exception:
             pass
 
@@ -4431,6 +4497,364 @@ def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns):
         except Exception: pass
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# DNS Connectivity Check  (Deploy Wizard — Step 2 Network)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _pcli_dns_vmk_create(vc_url, vc_user, vc_pass, pg_name, host_fqdn, ip, prefix):
+    """PowerCLI: create a temp vmk on an existing DVPortGroup for the DNS check.
+    Pre-cleans any stale vmk with the same IP before creating.
+    Returns (vmk_name, vlan_id, error_str)."""
+    import subprocess, tempfile, textwrap, re as _re, os
+    vc_host = vc_url.replace("https://","").replace("http://","").rstrip("/")
+    import ipaddress as _ipmod
+    netmask = str(_ipmod.IPv4Network(f"0.0.0.0/{prefix}").netmask)
+    script = textwrap.dedent(f"""\
+        $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
+        $ErrorActionPreference = 'SilentlyContinue'
+        Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
+        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+        $ErrorActionPreference = 'Stop'
+        Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
+        $vmhost  = Get-VMHost -Name '{host_fqdn}'
+        # Pre-flight: remove any stale vmk with the same IP (from a previous failed cleanup)
+        $ErrorActionPreference = 'SilentlyContinue'
+        $stale = Get-VMHostNetworkAdapter -VMHost $vmhost | Where-Object {{ $_.IP -eq '{ip}' }}
+        if ($stale) {{
+            Write-Host "PRE_CLEAN:$($stale.Name)"
+            Remove-VMHostNetworkAdapter -NetworkAdapter $stale -Confirm:$false
+            Start-Sleep -Seconds 3
+        }}
+        $ErrorActionPreference = 'Stop'
+        $pg      = Get-VDPortgroup -Name '{pg_name}' | Select-Object -First 1
+        $vds     = $pg.VDSwitch
+        $vlanCfg = $pg.VlanConfiguration
+        $vlanId  = if ($vlanCfg -ne $null -and $vlanCfg.VlanId -ne $null) {{ $vlanCfg.VlanId }} else {{ 0 }}
+        Write-Host "VLAN_ID:$vlanId"
+        $vmk = New-VMHostNetworkAdapter -VMHost $vmhost -VirtualSwitch $vds -PortGroup $pg -IP '{ip}' -SubnetMask '{netmask}'
+        Write-Host "VMK_NAME:$($vmk.Name)"
+        Disconnect-VIServer -Confirm:$false | Out-Null
+        Write-Host "DNS_SETUP_DONE"
+    """)
+    with tempfile.NamedTemporaryFile(suffix=".ps1", mode="w", delete=False, prefix="dns_setup_") as f:
+        f.write(script); script_path = f.name
+    try:
+        env = os.environ.copy()
+        env["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"
+        env.setdefault("HOME", "/root")
+        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
+                           capture_output=True, text=True, timeout=120, env=env)
+        out = _re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', r.stdout + r.stderr)
+        if "DNS_SETUP_DONE" not in out:
+            return None, None, f"PowerCLI vmk create failed:\n{out[:1500]}"
+        vmk_name = None; vlan_id = 0
+        for line in out.splitlines():
+            if line.startswith("VMK_NAME:"): vmk_name = line.split(":",1)[1].strip()
+            if line.startswith("VLAN_ID:"):
+                try: vlan_id = int(line.split(":",1)[1].strip())
+                except: vlan_id = 0
+        return vmk_name, vlan_id, ""
+    except subprocess.TimeoutExpired:
+        return None, None, "PowerCLI timed out (>120s)"
+    finally:
+        try: os.unlink(script_path)
+        except Exception: pass
+
+
+def _pcli_dns_vmk_remove(vc_url, vc_user, vc_pass, host_fqdn, vmk_name, ip=""):
+    """PowerCLI: remove the temp vmk created for the DNS check.
+    Looks up by name (Where-Object pipe) AND by IP as fallback — both reliable."""
+    if not vmk_name and not ip:
+        return
+    import subprocess, tempfile, textwrap, os
+    vc_host = vc_url.replace("https://","").replace("http://","").rstrip("/")
+    script = textwrap.dedent(f"""\
+        $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
+        $ErrorActionPreference = 'SilentlyContinue'
+        Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
+        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+        Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
+        $vmhost = Get-VMHost -Name '{host_fqdn}'
+        $allVmks = Get-VMHostNetworkAdapter -VMHost $vmhost
+        # Strategy 1: remove by name (pipe through Where-Object, reliable for vmkernel)
+        if ('{vmk_name}') {{
+            $byName = $allVmks | Where-Object {{ $_.Name -eq '{vmk_name}' }}
+            if ($byName) {{
+                Remove-VMHostNetworkAdapter -NetworkAdapter $byName -Confirm:$false
+                Write-Host "REMOVED_BY_NAME:{vmk_name}"
+            }}
+        }}
+        # Strategy 2: remove by IP (belt-and-suspenders for stale adapters)
+        if ('{ip}') {{
+            $allVmks2 = Get-VMHostNetworkAdapter -VMHost $vmhost
+            $byIp = $allVmks2 | Where-Object {{ $_.IP -eq '{ip}' }}
+            if ($byIp) {{
+                Remove-VMHostNetworkAdapter -NetworkAdapter $byIp -Confirm:$false
+                Write-Host "REMOVED_BY_IP:{ip}"
+            }}
+        }}
+        Disconnect-VIServer -Confirm:$false | Out-Null
+        Write-Host "CLEANUP_DONE"
+    """)
+    with tempfile.NamedTemporaryFile(suffix=".ps1", mode="w", delete=False, prefix="dns_clean_") as f:
+        f.write(script); script_path = f.name
+    try:
+        env = os.environ.copy()
+        env["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"
+        env.setdefault("HOME", "/root")
+        subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
+                       capture_output=True, text=True, timeout=90, env=env)
+    except Exception:
+        pass
+    finally:
+        try: os.unlink(script_path)
+        except Exception: pass
+
+
+@app.route("/api/dns-check-hosts", methods=["POST"])
+def dns_check_hosts():
+    """Return ESX hosts in a given cluster for the DNS check host selector."""
+    body       = request.get_json(force=True)
+    vc_url     = normalize_url(body.get("vc_url", ""))
+    vc_user    = body.get("vc_user", "") or body.get("username", "")
+    vc_pass    = body.get("vc_pass", "") or body.get("password", "")
+    cluster_id = body.get("cluster_moref", "")
+    try:
+        token, _ = vc_auth(vc_url, vc_user, vc_pass)
+        raw   = vc_get(vc_url, token, "/api/vcenter/host",
+                       params={"clusters": cluster_id}) or []
+        hosts = [{"name": h.get("name", ""),
+                  "short": (h.get("name", "")).split(".")[0]}
+                 for h in raw if h.get("name")]
+        return jsonify({"hosts": hosts})
+    except Exception as e:
+        return jsonify({"hosts": [], "error": str(e)})
+
+
+@app.route("/api/check-dns-connectivity", methods=["POST"])
+def check_dns_connectivity():
+    """
+    Deploy-wizard Step 2: verify management-VLAN connectivity for a single ESX host.
+    1. Enable SSH on selected host.
+    2. Create temp vmk on the selected management Port Group with the first Control-Plane IP.
+       (Pre-cleans any stale vmk with that IP before creating.)
+    3. vmkping gateway, vmkping DNS server, nslookup domain.
+    4. Always removes the temp vmk and restores SSH state in the finally block.
+    """
+    body       = request.get_json(force=True)
+    vc_url     = normalize_url(body.get("vc_url", ""))
+    vc_user    = body.get("vc_user", "")
+    vc_pass    = body.get("vc_pass", "")
+    cluster_id    = body.get("cluster_moref", "")
+    selected_host = (body.get("selected_host") or "").strip()
+    pg_name       = body.get("port_group_name") or body.get("port_group_id", "")
+    first_ip_raw  = body.get("first_ip", "")
+    gateway_cidr  = body.get("gateway_cidr", "")
+    dns_raw       = body.get("dns_servers", "")
+    search_dom    = (body.get("search_domain") or "").strip()
+    esx_pass      = body.get("esx_pass", "")
+
+    first_ip = re.split(r'[-/\s]', first_ip_raw.strip())[0].strip()
+    if not first_ip:
+        return jsonify({"success": False, "error": "No Control-Plane IP provided"})
+    try:    prefix = int(gateway_cidr.split("/")[-1])
+    except: prefix = 24
+    gw_ip    = gateway_cidr.split("/")[0].strip()
+    dns_list = [s.strip() for s in re.split(r'[,\s]+', dns_raw) if s.strip()]
+    if not dns_list:
+        return jsonify({"success": False, "error": "No DNS server specified"})
+    dns_ip = dns_list[0]
+
+    result = {
+        "success": False, "error": "",
+        "host": "", "vmk": "", "vlan_id": None, "ip_used": first_ip,
+        "gw_ping": None, "dns_ping": None, "dns_resolve": None,
+        "gw_ping_output": "", "dns_ping_output": "", "dns_resolve_output": "",
+        "dns_domain": "",
+    }
+    vmk_name = None; host_name = ""; ssh_was_on = None
+    vmk_removed_via_ssh = False   # always defined — referenced in outer finally
+
+    try:
+        import time as _time, paramiko as _para
+    except ImportError as e:
+        result["error"] = f"Missing dependency: {e}"
+        return jsonify(result)
+
+    try:
+        token, _ = vc_auth(vc_url, vc_user, vc_pass)
+
+        hosts = vc_get(vc_url, token, "/api/vcenter/host",
+                       params={"clusters": cluster_id}) or []
+        if not hosts:
+            result["error"] = "No ESX hosts found in the selected cluster"
+            return jsonify(result)
+        host_name = selected_host if selected_host else hosts[0].get("name", "")
+        result["host"] = host_name
+
+        ok_ssh, ssh_was_on = _vc_manage_ssh(vc_url, vc_user, vc_pass, host_name, True)
+        if not ok_ssh:
+            result["error"] = f"Could not enable SSH on {host_name} via vCenter"
+            return jsonify(result)
+        if not ssh_was_on:
+            _time.sleep(5)
+
+        # Create temp vmk (pre-cleans any stale vmk with same IP automatically)
+        vmk_name, vlan_id, pcli_err = _pcli_dns_vmk_create(
+            vc_url, vc_user, vc_pass, pg_name, host_name, first_ip, prefix)
+        if pcli_err:
+            result["error"] = f"PowerCLI setup failed: {pcli_err}"
+            return jsonify(result)
+        result["vmk"]     = vmk_name or ""
+        result["vlan_id"] = vlan_id
+        _time.sleep(3)
+
+        ssh_client = _para.SSHClient()
+        ssh_client.set_missing_host_key_policy(_para.AutoAddPolicy())
+        try:
+            for attempt in range(6):
+                try:
+                    ssh_client.connect(host_name, username="root",
+                                       password=esx_pass, timeout=10)
+                    break
+                except _para.AuthenticationException:
+                    raise RuntimeError(
+                        f"ESX root password incorrect for {host_name}. "
+                        "Please enter the correct password and run again.")
+                except Exception:
+                    if attempt < 5: _time.sleep(2)
+                    else: raise RuntimeError(
+                        f"Cannot reach {host_name} via SSH. "
+                        "Check that port 22 is reachable from this VM.")
+
+            def _run(cmd, timeout=30):
+                _, so, se = ssh_client.exec_command(cmd, timeout=timeout)
+                return so.read().decode("utf-8","replace"), se.read().decode("utf-8","replace")
+
+            # 1. Gateway ping
+            gw_out, gw_err = _run(f"vmkping -I {vmk_name} -c 3 -W 2 {gw_ip}", timeout=30)
+            gw_pass = "0% packet loss" in gw_out or "bytes from" in gw_out
+            result["gw_ping"]        = "pass" if gw_pass else "fail"
+            result["gw_ping_output"] = (gw_out + gw_err).strip()
+
+            # 2. DNS server reachability ping
+            dn_out, dn_err = _run(f"vmkping -I {vmk_name} -c 3 -W 2 {dns_ip}", timeout=30)
+            dn_pass = "0% packet loss" in dn_out or "bytes from" in dn_out
+            result["dns_ping"]        = "pass" if dn_pass else "fail"
+            result["dns_ping_output"] = (dn_out + dn_err).strip()
+
+            # 3. DNS resolution — always test the vCenter itself.
+            #   · FQDN input → forward lookup: nslookup vc-mgmt-a.site-a.vcf.lab <dns>
+            #   · IP input   → reverse lookup to get FQDN, then forward lookup to verify
+            # This is the most meaningful test: the Supervisor VMs must be able to
+            # resolve vCenter by FQDN for day-2 operations.
+
+            def _nslookup(query):
+                """Run nslookup, fall back to busybox if no output."""
+                _o, _e = _run(f"nslookup {query} {dns_ip} 2>&1", timeout=15)
+                if not _o.strip():
+                    _o, _e = _run(f"busybox nslookup {query} {dns_ip} 2>&1", timeout=15)
+                return (_o + _e).strip()
+
+            def _parse_ptr(output):
+                """Extract FQDN from a reverse (PTR) nslookup response.
+                Handles both standard 'name = host.' and busybox 'Address: host.' formats."""
+                import re as _r2
+                for _ln in output.splitlines():
+                    # Standard nslookup: "10.x.x.x.in-addr.arpa  name = vc-mgmt-a.site-a.vcf.lab."
+                    _m = _r2.search(r'name\s*=\s*(\S+)', _ln, _r2.IGNORECASE)
+                    if _m:
+                        return _m.group(1).rstrip('.')
+                # Busybox nslookup: "Address 1: vc-mgmt-a.site-a.vcf.lab."
+                for _ln in output.splitlines():
+                    if not _ln.strip().lower().startswith("address"):
+                        continue
+                    _parts = _ln.split(":", 1)
+                    if len(_parts) < 2:
+                        continue
+                    _val = _parts[1].strip().rstrip('.')
+                    if '#' in _val:          # skip "10.1.1.1#53" (server line)
+                        continue
+                    if ('.' in _val and      # contains dots → likely FQDN
+                            not _val.replace('.','').replace('-','').replace('_','').isdigit()):
+                        return _val
+                return ""
+
+            def _fwd_passed(output):
+                """True if a forward nslookup returned a real answer."""
+                return ("Name:" in output and
+                        "can't find"  not in output and
+                        "NXDOMAIN"    not in output and
+                        "REFUSED"     not in output and
+                        "timed out"   not in output.lower())
+
+            _vc_host_raw = (urlparse(vc_url).hostname or "").strip()
+            _vc_is_ip    = bool(_vc_host_raw) and all(
+                p.isdigit() for p in _vc_host_raw.split(".") if p)
+
+            if _vc_is_ip:
+                # Step 1: reverse lookup (IP → FQDN)
+                rev_out = _nslookup(_vc_host_raw)
+                _vc_fqdn = _parse_ptr(rev_out)
+
+                if _vc_fqdn:
+                    # Step 2: forward lookup (FQDN → confirm IP resolves)
+                    fwd_out = _nslookup(_vc_fqdn)
+                    ns_pass = _fwd_passed(fwd_out)
+                    ns_combined = (
+                        f"Reverse lookup ({_vc_host_raw} → PTR):\n{rev_out}"
+                        f"\n\nForward lookup ({_vc_fqdn}):\n{fwd_out}"
+                    )
+                    result["dns_domain"] = _vc_fqdn
+                else:
+                    # No PTR record — fail, show the reverse output
+                    ns_pass     = False
+                    ns_combined = (
+                        f"Reverse lookup ({_vc_host_raw} → PTR):\n{rev_out}"
+                        f"\n\n(No PTR record — cannot perform forward lookup)"
+                    )
+                    result["dns_domain"] = f"{_vc_host_raw} (PTR)"
+            else:
+                # FQDN input: single forward lookup
+                fwd_out = _nslookup(_vc_host_raw)
+                ns_pass = _fwd_passed(fwd_out)
+                ns_combined = fwd_out
+                result["dns_domain"] = _vc_host_raw
+
+            result["dns_resolve"]        = "pass" if ns_pass else "fail"
+            result["dns_resolve_output"] = ns_combined[:800]
+            result["success"] = True
+
+        finally:
+            # Primary vmk cleanup: esxcli runs in the SSH finally block so it
+            # executes whether the tests passed, failed, or raised an exception —
+            # as long as the SSH connection was established.
+            if vmk_name:
+                try:
+                    _run(f"esxcli network ip interface remove -i {vmk_name}", timeout=15)
+                    vmk_removed_via_ssh = True
+                except Exception:
+                    pass
+            try: ssh_client.close()
+            except Exception: pass
+
+    except RuntimeError as e:
+        result["error"] = str(e)
+    except Exception as e:
+        result["error"] = str(e)
+    finally:
+        # Fallback cleanup via PowerCLI (runs only if SSH removal didn't happen,
+        # e.g. SSH was unreachable or the test aborted before cleanup ran).
+        if vmk_name and host_name and not vmk_removed_via_ssh:
+            try: _pcli_dns_vmk_remove(vc_url, vc_user, vc_pass, host_name, vmk_name, first_ip)
+            except Exception: pass
+        if host_name and ssh_was_on is False:
+            try: _vc_manage_ssh(vc_url, vc_user, vc_pass, host_name, False)
+            except Exception: pass
+
+    return jsonify(result)
+
+
 @app.route("/api/check-vlan", methods=["POST"])
 def check_vlan():
     """
@@ -4814,6 +5238,16 @@ def check_vlan():
                 test["output"] = "\n".join(steps)
             finally:
                 if ssh_client:
+                    # Primary vmk cleanup: esxcli while SSH is still open —
+                    # runs whether the test passed, failed, or raised an exception.
+                    if vmk_dev:
+                        try:
+                            _, _so, _ = ssh_client.exec_command(
+                                f"esxcli network ip interface remove -i {vmk_dev}",
+                                timeout=15)
+                            _so.read()   # drain channel so it closes cleanly
+                        except Exception:
+                            pass
                     try: ssh_client.close()
                     except Exception: pass
                 if ssh_state is False:

@@ -1532,9 +1532,14 @@
                     <div class="clr-form-control" style="margin-bottom:0.7rem;">
                       <label class="clr-control-label" style="font-size:0.68rem;">Supervisor Control-Plane Mgt IPs</label>
                       <div class="clr-control-container"><div class="clr-input-wrapper">
-                        <input type="text" x-model="wizardConfig.first_ip" placeholder="e.g. 10.1.1.85-10.1.1.89" class="clr-input">
+                        <input type="text" x-model="wizardConfig.first_ip" placeholder="e.g. 10.1.1.85-10.1.1.89" class="clr-input"
+                               :style="wizardConfig.first_ip && firstIpError() ? 'border-color:#c00;' : ''">
                       </div></div>
-                      <p style="font-size:0.62rem; color:#6e777b; margin-top:0.2rem;">Enter the first IP or the full range — 5 consecutive IPs will be reserved</p>
+                      <p x-show="wizardConfig.first_ip && firstIpError()"
+                         x-text="firstIpError()"
+                         style="font-size:0.72rem; color:#c00; margin-top:0.25rem; display:none;"></p>
+                      <p x-show="!wizardConfig.first_ip || !firstIpError()"
+                         style="font-size:0.62rem; color:#6e777b; margin-top:0.2rem;">5 consecutive IPs will be reserved for Supervisor VMs.</p>
                     </div>
                   </div>
                   <div class="clr-col-12 clr-col-md-6">
@@ -1559,7 +1564,9 @@
                     <div class="clr-form-control" style="margin-bottom:0.7rem;">
                       <label class="clr-control-label" style="font-size:0.68rem;">Search Domain(s)</label>
                       <div class="clr-control-container"><div class="clr-input-wrapper">
-                        <input type="text" x-model="wizardConfig.search_domains" placeholder="site-a.vcf.lab" class="clr-input">
+                        <input type="text" x-model="wizardConfig.search_domains"
+                               :placeholder="'e.g. ' + ((wizardOptions && wizardOptions.vc_defaults && wizardOptions.vc_defaults.search_domains && wizardOptions.vc_defaults.search_domains[0]) || 'site-a.vcf.lab')"
+                               class="clr-input">
                       </div></div>
                     </div>
                   </div>
@@ -1768,11 +1775,29 @@
                 </button>
                 <div x-show="wizardStep < 2 || wizardStep > 5"></div>
 
+                <!-- Flex spacer — always pushes right-side buttons to the right -->
+                <div style="flex:1;"></div>
+
+                <!-- Check DNS Connectivity — step 2 only; grey → green/red after test -->
+                <button x-show="wizardStep === 2 && wizardConfig.port_group_id && wizardConfig.first_ip && wizardConfig.gateway_cidr && wizardConfig.dns_servers"
+                        :disabled="!!firstIpError()"
+                        @click="dnsCheckModal.show = true; dnsCheckModal.done = false; dnsCheckModal.result = null; dnsCheckModal.error = ''; fetchDnsCheckHosts();"
+                        class="btn btn-sm"
+                        :class="{
+                          'btn-outline': !dnsCheckModal.done,
+                          'btn-success': dnsCheckModal.done && dnsCheckModal.result && dnsCheckModal.result.gw_ping==='pass' && dnsCheckModal.result.dns_ping==='pass' && dnsCheckModal.result.dns_resolve==='pass',
+                          'btn-danger':  dnsCheckModal.done && !(dnsCheckModal.result && dnsCheckModal.result.gw_ping==='pass' && dnsCheckModal.result.dns_ping==='pass' && dnsCheckModal.result.dns_resolve==='pass')
+                        }"
+                        style="margin-right:0.5rem; font-size:0.76rem;">
+                  <i :class="!dnsCheckModal.done ? 'fas fa-network-wired' : (dnsCheckModal.result && dnsCheckModal.result.gw_ping==='pass' && dnsCheckModal.result.dns_ping==='pass' && dnsCheckModal.result.dns_resolve==='pass' ? 'fas fa-check-circle' : 'fas fa-times-circle')"
+                     style="font-size:0.68rem; margin-right:0.3rem;"></i>Check DNS Connectivity
+                </button>
+
                 <button x-show="wizardStep >= 1 && wizardStep < 5"
                         @click="wizardAdvance()"
                         :disabled="
                           (wizardStep===1 && !wizardConfig.cluster_moref) ||
-                          (wizardStep===2 && (!wizardConfig.port_group_id || !wizardConfig.first_ip || !wizardConfig.gateway_cidr || !wizardConfig.dns_servers || !wizardConfig.nsx_project_path || !wizardConfig.vpc_connectivity_profile_path)) ||
+                          (wizardStep===2 && (!wizardConfig.port_group_id || !wizardConfig.first_ip || !!firstIpError() || !wizardConfig.gateway_cidr || !wizardConfig.dns_servers || !wizardConfig.nsx_project_path || !wizardConfig.vpc_connectivity_profile_path)) ||
                           (wizardStep===3 && !wizardConfig.storage_policy_uuid) ||
                           (wizardStep===4 && !wizardConfig.name)
                         "
@@ -3354,6 +3379,205 @@
   </div>
 
 
+  <!-- ═══ Check DNS Connectivity modal ════════════════════════════════ -->
+  <div x-show="dnsCheckModal.show" x-cloak
+       x-transition:enter="transition ease-out duration-200"
+       x-transition:enter-start="opacity-0"
+       x-transition:enter-end="opacity-100"
+       x-transition:leave="transition ease-in duration-150"
+       x-transition:leave-start="opacity-100"
+       x-transition:leave-end="opacity-0"
+       class="modal" aria-hidden="false">
+    <div class="modal-dialog" role="dialog" aria-modal="true"
+         style="max-width:760px; width:100%; display:flex; flex-direction:column; max-height:92vh;">
+      <div class="modal-content" style="display:flex; flex-direction:column; max-height:92vh;">
+
+        <div class="modal-header">
+          <button @click="dnsCheckModal.show = false" aria-label="Close" class="close">
+            <i class="fas fa-times"></i>
+          </button>
+          <h3 class="modal-title" style="font-size:1rem;">
+            <i class="fas fa-network-wired" style="color:#0072a3; margin-right:0.4rem;"></i>
+            Check DNS Connectivity
+          </h3>
+        </div>
+
+        <div class="modal-body" style="flex:1; overflow-y:auto;">
+
+          <!-- Input form (before running) -->
+          <template x-if="!dnsCheckModal.done && !dnsCheckModal.loading">
+            <div>
+              <!-- Info banner -->
+              <div style="background:#f0f7ff; border:1px solid #b3d4f5; border-radius:3px;
+                          padding:0.6rem 0.85rem; margin-bottom:1rem; font-size:0.82rem; color:#1a5276;">
+                <i class="fas fa-info-circle" style="margin-right:0.4rem;"></i>
+                This tool will:<br>
+                · <strong>Enable SSH temporarily</strong> if not already enabled<br>
+                · Create a temp VMkernel interface in the selected Port Group with IP
+                  <code x-text="wizardConfig.first_ip ? wizardConfig.first_ip.split('-')[0] : '…'"></code><br>
+                · Ping the default gateway to verify layer-3 connectivity<br>
+                · Ping the DNS server and attempt DNS name resolution for vCenter<br>
+                · <strong>Remove the vmk and disable SSH automatically</strong>
+                  (if SSH was already enabled, it will be left as-is)
+              </div>
+
+              <!-- ESX host selector -->
+              <div class="clr-form-control" style="margin-bottom:0.75rem;">
+                <label class="clr-control-label" style="font-size:0.68rem;">ESX Host</label>
+                <div class="clr-control-container">
+                  <template x-if="dnsCheckModal.hostsLoading">
+                    <span style="font-size:0.8rem; color:#6e777b;">
+                      <i class="fas fa-circle-notch fa-spin" style="margin-right:0.3rem;"></i>Loading hosts…
+                    </span>
+                  </template>
+                  <template x-if="!dnsCheckModal.hostsLoading">
+                    <div class="clr-select-wrapper">
+                      <select x-model="dnsCheckModal.selectedHost" class="clr-select">
+                        <template x-for="h in dnsCheckModal.hosts" :key="h.name">
+                          <option :value="h.name" x-text="h.short || h.name"></option>
+                        </template>
+                      </select>
+                    </div>
+                  </template>
+                </div>
+              </div>
+
+              <!-- ESX root password -->
+              <div class="clr-form-control">
+                <label class="clr-control-label" style="font-size:0.68rem;">ESX Root Password</label>
+                <div class="clr-control-container"><div class="clr-input-wrapper">
+                  <input type="password" x-model="dnsCheckModal.esx_pass"
+                         placeholder="root password"
+                         class="clr-input"
+                         @keydown.enter="dnsCheckModal.esx_pass && dnsCheckModal.selectedHost && runDnsCheck()">
+                </div></div>
+                <p style="font-size:0.62rem; color:#6e777b; margin-top:0.2rem;">
+                  SSH is enabled temporarily, tests run, then disabled — no lasting changes.
+                </p>
+              </div>
+            </div>
+          </template>
+
+          <!-- Spinner -->
+          <template x-if="dnsCheckModal.loading">
+            <div style="text-align:center; padding:2.5rem; color:#6e777b;">
+              <span style="display:inline-block; width:2.5rem; height:2.5rem;
+                    border:3px solid #dfe3e6; border-top-color:#0072a3; border-radius:50%;
+                    animation:clr-spin 0.8s linear infinite;"></span>
+              <p style="margin-top:0.75rem; font-size:0.85rem;">Running connectivity test… (may take ~1 minute)</p>
+            </div>
+          </template>
+
+          <!-- Results -->
+          <template x-if="dnsCheckModal.done">
+            <div>
+              <template x-if="dnsCheckModal.error">
+                <div style="background:#fdf0f0; border:1px solid #f5c2c2; border-radius:3px;
+                            padding:0.6rem 0.85rem; margin-bottom:0.75rem; font-size:0.84rem; color:#c00;">
+                  <i class="fas fa-times-circle" style="margin-right:0.35rem;"></i>
+                  <span x-text="dnsCheckModal.error"></span>
+                </div>
+              </template>
+
+              <template x-if="!dnsCheckModal.error && dnsCheckModal.result">
+                <div>
+                  <div style="font-size:0.79rem; color:#4a5568; margin-bottom:0.7rem;">
+                    Host: <strong x-text="dnsCheckModal.result.host"></strong>
+                    &nbsp;·&nbsp; vmk: <code x-text="dnsCheckModal.result.vmk || '—'"></code>
+                    &nbsp;·&nbsp; IP: <code x-text="dnsCheckModal.result.ip_used"></code>
+                    <template x-if="dnsCheckModal.result.vlan_id">
+                      <span>&nbsp;·&nbsp; VLAN: <code x-text="dnsCheckModal.result.vlan_id"></code></span>
+                    </template>
+                  </div>
+
+                  <table style="width:100%; border-collapse:collapse; font-size:0.83rem;">
+                    <tbody>
+                      <tr style="border-bottom:1px solid #f0f0f0;">
+                        <td style="padding:0.45rem 0.7rem 0.45rem 0; white-space:nowrap; color:#2d3748; font-weight:600; width:42%;">
+                          <i class="fas fa-route" style="color:#6e777b; margin-right:0.4rem; font-size:0.78rem;"></i>
+                          Ping gateway
+                          <span style="font-weight:400; color:#6e777b;" x-text="'(' + wizardConfig.gateway_cidr.split('/')[0] + ')'"></span>
+                        </td>
+                        <td style="padding:0.4rem 0.5rem;">
+                          <span :style="{color:dnsCheckModal.result.gw_ping==='pass'?'#1a7a1a':'#c00',fontWeight:'600',fontSize:'0.82rem'}">
+                            <i :class="dnsCheckModal.result.gw_ping==='pass'?'fas fa-check-circle':'fas fa-times-circle'" style="margin-right:0.3rem;"></i>
+                            <span x-text="dnsCheckModal.result.gw_ping==='pass'?'Reachable':'Not reachable'"></span>
+                          </span>
+                          <div x-show="dnsCheckModal.result.gw_ping_output"
+                               style="font-size:0.73rem;color:#6e777b;font-family:monospace;margin-top:0.25rem;white-space:pre-wrap;max-height:5rem;overflow-y:auto;"
+                               x-text="dnsCheckModal.result.gw_ping_output"></div>
+                        </td>
+                      </tr>
+                      <tr style="border-bottom:1px solid #f0f0f0;">
+                        <td style="padding:0.45rem 0.7rem 0.45rem 0; white-space:nowrap; color:#2d3748; font-weight:600;">
+                          <i class="fas fa-server" style="color:#6e777b; margin-right:0.4rem; font-size:0.78rem;"></i>
+                          Ping DNS server
+                          <span style="font-weight:400; color:#6e777b;" x-text="'(' + (wizardConfig.dns_servers.split(/[,\s]+/)[0]||'') + ')'"></span>
+                        </td>
+                        <td style="padding:0.4rem 0.5rem;">
+                          <span :style="{color:dnsCheckModal.result.dns_ping==='pass'?'#1a7a1a':'#c00',fontWeight:'600',fontSize:'0.82rem'}">
+                            <i :class="dnsCheckModal.result.dns_ping==='pass'?'fas fa-check-circle':'fas fa-times-circle'" style="margin-right:0.3rem;"></i>
+                            <span x-text="dnsCheckModal.result.dns_ping==='pass'?'Reachable':'Not reachable'"></span>
+                          </span>
+                          <div x-show="dnsCheckModal.result.dns_ping_output"
+                               style="font-size:0.73rem;color:#6e777b;font-family:monospace;margin-top:0.25rem;white-space:pre-wrap;max-height:5rem;overflow-y:auto;"
+                               x-text="dnsCheckModal.result.dns_ping_output"></div>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0.45rem 0.7rem 0.45rem 0; white-space:nowrap; color:#2d3748; font-weight:600; vertical-align:top;">
+                          <i class="fas fa-search" style="color:#6e777b; margin-right:0.4rem; font-size:0.78rem;"></i>
+                          DNS resolution
+                          <span style="font-weight:400; color:#6e777b;" x-text="dnsCheckModal.result.dns_domain?'('+dnsCheckModal.result.dns_domain+')':''"></span>
+                        </td>
+                        <td style="padding:0.4rem 0.5rem;">
+                          <span :style="{color:dnsCheckModal.result.dns_resolve==='pass'?'#1a7a1a':'#c00',fontWeight:'600',fontSize:'0.82rem'}">
+                            <i :class="dnsCheckModal.result.dns_resolve==='pass'?'fas fa-check-circle':'fas fa-times-circle'" style="margin-right:0.3rem;"></i>
+                            <span x-text="dnsCheckModal.result.dns_resolve==='pass'?'Resolved':'Not resolved'"></span>
+                          </span>
+                          <div x-show="dnsCheckModal.result.dns_resolve_output"
+                               style="font-size:0.73rem;color:#6e777b;font-family:monospace;margin-top:0.25rem;white-space:pre-wrap;max-height:6rem;overflow-y:auto;"
+                               x-text="dnsCheckModal.result.dns_resolve_output"></div>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+
+                  <div x-data="{get allPass(){const r=dnsCheckModal.result;return r&&r.gw_ping==='pass'&&r.dns_ping==='pass'&&r.dns_resolve==='pass';}}"
+                       :style="{background:allPass?'#f3fbf0':'#fdf0f0',border:'1px solid '+(allPass?'#c6e8ae':'#f5c2c2'),
+                                borderRadius:'3px',padding:'0.55rem 0.8rem',marginTop:'0.8rem',
+                                fontSize:'0.83rem',color:allPass?'#1a7a1a':'#c00',fontWeight:'600'}">
+                    <i :class="allPass?'fas fa-check-circle':'fas fa-exclamation-circle'" style="margin-right:0.35rem;"></i>
+                    <span x-text="allPass?'All checks passed - Supervisor VMs will have DNS connectivity.':'One or more checks failed — verify your Port Group, gateway, and DNS settings.'"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+
+        </div><!-- /modal-body -->
+
+        <div class="modal-footer">
+          <button @click="dnsCheckModal.show = false" class="btn btn-outline btn-sm">Close</button>
+          <template x-if="!dnsCheckModal.loading && (!dnsCheckModal.done || dnsCheckModal.error)">
+            <button @click="runDnsCheck()"
+                    :disabled="!dnsCheckModal.esx_pass || !dnsCheckModal.selectedHost"
+                    class="btn btn-primary btn-sm">
+              <i class="fas fa-play" style="font-size:0.68rem; margin-right:0.3rem;"></i>Run Check
+            </button>
+          </template>
+          <template x-if="dnsCheckModal.done && !dnsCheckModal.loading && !dnsCheckModal.error">
+            <button @click="dnsCheckModal.done = false; dnsCheckModal.result = null; dnsCheckModal.error = '';"
+                    class="btn btn-outline btn-sm">
+              <i class="fas fa-redo" style="font-size:0.68rem; margin-right:0.3rem;"></i>Run Again
+            </button>
+          </template>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
   <!-- ═══ Check VLAN modal ══════════════════════════════════════════════ -->
   <div x-show="vlanModal.show" x-cloak
        x-transition:enter="transition ease-out duration-200"
@@ -3702,6 +3926,12 @@
       mtuResult: {},   // colKey → 'pass' | 'fail' | null
 
       // ── VLAN Check ─────────────────────────────────────────────────────────
+      dnsCheckModal: {
+        show: false, loading: false, done: false,
+        esx_pass: '', result: null, error: '',
+        hosts: [], hostsLoading: false, selectedHost: '',
+      },
+
       vlanModal: {
         show: false, loading: false, done: false,
         hosts: [],          // [{name, short, healthy, password}] — one per prepared ESX
@@ -5335,6 +5565,94 @@
         } catch(e) {
           m.error = String(e);
           this.vlanResult = 'fail';
+        } finally {
+          m.loading = false;
+          m.done    = true;
+        }
+      },
+
+      firstIpError() {
+        const val = (this.wizardConfig.first_ip || '').trim();
+        if (!val) return '';
+        const ERR = 'Enter a range of 5 (e.g. 10.1.1.85-10.1.1.89)';
+        const ipRe = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+        if (val.includes('-')) {
+          const parts = val.split('-');
+          if (parts.length !== 2) return ERR;
+          const m1 = parts[0].trim().match(ipRe);
+          const m2 = parts[1].trim().match(ipRe);
+          if (!m1 || !m2) return ERR;
+          for (const m of [m1, m2])
+            for (let i = 1; i <= 4; i++)
+              if (parseInt(m[i]) > 255) return ERR;
+          if (m1[1]!==m2[1] || m1[2]!==m2[2] || m1[3]!==m2[3]) return ERR;
+          const diff = parseInt(m2[4]) - parseInt(m1[4]) + 1;
+          if (diff !== 5) return ERR;
+          return '';
+        } else {
+          const m = val.match(ipRe);
+          if (!m) return ERR;
+          for (let i = 1; i <= 4; i++)
+            if (parseInt(m[i]) > 255) return ERR;
+          return '';
+        }
+      },
+
+      async fetchDnsCheckHosts() {
+        const m = this.dnsCheckModal;
+        m.hosts = []; m.selectedHost = ''; m.hostsLoading = true;
+        try {
+          const r = await fetch('/api/dns-check-hosts', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              vc_url:        this.form.vc_url,
+              vc_user:       this.form.username,
+              vc_pass:       this.form.password,
+              cluster_moref: this.wizardConfig.cluster_moref,
+            })
+          });
+          const d = await r.json();
+          m.hosts = d.hosts || [];
+          if (m.hosts.length > 0) m.selectedHost = m.hosts[0].name;
+        } catch(e) {
+          m.hosts = [];
+        } finally {
+          m.hostsLoading = false;
+        }
+      },
+
+      async runDnsCheck() {
+        const m = this.dnsCheckModal;
+        m.loading = true; m.done = false; m.result = null; m.error = '';
+        try {
+          const pgs    = (this.wizardOptions && this.wizardOptions.port_groups) || [];
+          const pgName = pgs.find(p => p.network === this.wizardConfig.port_group_id)?.name
+                         || this.wizardConfig.port_group_name
+                         || this.wizardConfig.port_group_id;
+          const r = await fetch('/api/check-dns-connectivity', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              vc_url:          this.form.vc_url,
+              vc_user:         this.form.username,
+              vc_pass:         this.form.password,
+              cluster_moref:   this.wizardConfig.cluster_moref,
+              selected_host:   m.selectedHost,
+              port_group_id:   this.wizardConfig.port_group_id,
+              port_group_name: pgName,
+              first_ip:        this.wizardConfig.first_ip,
+              gateway_cidr:    this.wizardConfig.gateway_cidr,
+              dns_servers:     this.wizardConfig.dns_servers,
+              search_domain:   this.wizardConfig.search_domains,
+              esx_pass:        m.esx_pass,
+            })
+          });
+          const d = await r.json();
+          m.result = d;
+          if (!d.success && d.error) m.error = d.error;
+        } catch(e) {
+          m.error = String(e);
         } finally {
           m.loading = false;
           m.done    = true;
