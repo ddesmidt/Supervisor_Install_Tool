@@ -12,8 +12,7 @@ The web interface uses the **[Clarity Design System](https://clarity.design)** (
 2. **Check if Supervisor is Installed** — query the current state
 3. **Check Supervisor Requirements** — 3-column readiness matrix with fix wizards
 4. **Deploy Supervisor** — guided deployment wizard (available once requirements pass)
-
-Once the Supervisor is running, additional post-deployment sections appear for VKS cluster listing, network topology, and connectivity testing.
+5. **VKS Deployment Validation** — post-deployment: VKS cluster listing, network topology, and connectivity testing (visible once Supervisor is running)
 
 ---
 
@@ -140,9 +139,7 @@ Clicking it opens a wizard that:
 
 The button turns green only when all hosts pass the gateway ping **and** no IP conflicts were detected.
 
----
-
-## Step 4 — Fixing Prerequisites
+### Fixing Prerequisites
 
 The following steps have automated Fix wizards:
 
@@ -157,7 +154,7 @@ The following steps have automated Fix wizards:
 | R5-3 — External IP Block | Distributed + Centralized | Creates an NSX External IP Block |
 | R5-4 — VPC Connectivity Profile | Distributed + Centralized | Creates or updates the VPC Connectivity Profile in the NSX Default Project |
 
-### VNA Cluster Deployment (R4 Distributed)
+#### VNA Cluster Deployment (R4 Distributed)
 
 When you click **Fix** on R4 Distributed, a 3-step wizard opens:
 
@@ -167,7 +164,7 @@ When you click **Fix** on R4 Distributed, a 3-step wizard opens:
 
 After clicking Deploy, the wizard shows live progress (polled every 30 seconds). Deployment typically takes 15–20 minutes.
 
-### Cascade Fix (R5-1 Distributed)
+#### Cascade Fix (R5-1 Distributed)
 
 The R5-1 Distributed External Connection fix wizard includes an optional **"Also auto-fix R5-2, R5-3, R5-4"** checkbox. When enabled, after creating the DVLAN connection the tool automatically:
 1. Attaches the Transit Gateway to the new connection (R5-2)
@@ -176,7 +173,7 @@ The R5-1 Distributed External Connection fix wizard includes an optional **"Also
 
 Each sub-step is shown with its own progress row. Steps that cannot complete (e.g. R5-4 is skipped if no VNA Cluster exists yet) are marked as skipped with a warning message.
 
-### VPC Connectivity Profile (R5-4 Distributed)
+#### VPC Connectivity Profile (R5-4 Distributed)
 
 The R5-4 fix wizard auto-populates fields from data already discovered during the requirements check:
 
@@ -188,7 +185,7 @@ The R5-4 fix wizard auto-populates fields from data already discovered during th
 
 ---
 
-## Step 5 — Deploy Supervisor
+## Step 4 — Deploy Supervisor
 
 Once all steps in a column are green, click **"Deploy Supervisor"** in that column.
 
@@ -244,7 +241,11 @@ After clicking **"Deploy"**, the wizard switches to a status view that polls eve
 
 ---
 
-## Step 6 — VKS Clusters (Tanzu Kubernetes)
+## Step 5 — VKS Deployment Validation
+
+Once the Supervisor is **RUNNING**, three post-deployment sections appear below the install status banner.
+
+### VKS Clusters (Tanzu Kubernetes)
 
 Once the Supervisor is **RUNNING**, a **VKS Clusters** section appears below the install status banner. It lists all Tanzu Kubernetes (VKS/TKG) clusters deployed under the Supervisor.
 
@@ -275,7 +276,7 @@ A summary line shows the Supervisor VIP and the total number of clusters and nam
 
 ---
 
-## Step 7 — Network Topology
+### Network Topology
 
 Clicking **"Topology"** on a VKS cluster row opens the **Network Topology** modal. It queries NSX directly and renders a live SVG diagram showing the complete network path from the physical upstream router down to the highlighted VKS cluster.
 
@@ -314,7 +315,7 @@ The NSX response is cached in the page session. If you open the Topology modal f
 
 ---
 
-## Step 8 — Connectivity Test
+### Connectivity Test
 
 Clicking **"Test"** on a VKS cluster row opens the **Connectivity Test** modal, which runs three groups of tests to verify network reachability between the Supervisor and the VKS cluster.
 
