@@ -1528,9 +1528,10 @@ def install_supervisor():
             raw_first_ip = raw_first_ip.split("-")[0].strip()
         cfg["first_ip"] = raw_first_ip
 
-        dns = _list(cfg.get("dns_servers", ""))
-        ntp = _list(cfg.get("ntp_servers", ""))
-        domains = _list(cfg.get("search_domains", ""))
+        dns_mgmt     = _list(cfg.get("dns_servers", ""))
+        dns_workload = _list(cfg.get("dns_servers_workload", "")) or dns_mgmt
+        ntp          = _list(cfg.get("ntp_servers", ""))
+        domains      = _list(cfg.get("search_domains", ""))
 
         spec = {
             "name": cfg["name"],
@@ -1544,7 +1545,7 @@ def install_supervisor():
                         "network": cfg["port_group_id"],
                     },
                     "services": {
-                        "dns": {"servers": dns, "search_domains": domains},
+                        "dns": {"servers": dns_mgmt, "search_domains": domains},
                         "ntp": {"servers": ntp},
                     },
                     "ip_management": {
@@ -1573,7 +1574,7 @@ def install_supervisor():
                         "default_private_cidrs": [{"address": "172.30.0.0", "prefix": 16}],
                     },
                     "services": {
-                        "dns": {"servers": dns, "search_domains": domains},
+                        "dns": {"servers": dns_workload, "search_domains": domains},
                         "ntp": {"servers": ntp},
                     },
                     "ip_management": {
@@ -4561,6 +4562,109 @@ def _pcli_dns_vmk_create(vc_url, vc_user, vc_pass, pg_name, host_fqdn, ip, prefi
         except Exception: pass
 
 
+def _pcli_vmk_on_stack(vc_url, vc_user, vc_pass, host_name, pg_name, stack_name,
+                        create_pg=False, vds_name=None, vlan_id=None, ip_to_exclude=None):
+    """
+    PowerCLI: create a VMkernel on a custom TCP/IP stack that was previously
+    created on the host via 'esxcli network ip netstack add'.
+    No IP is assigned here — caller sets IP via esxcli afterward.
+
+    create_pg=False  Use existing portgroup by name (pg_name).
+    create_pg=True   Create a new DVPortGroup on vds_name with vlan_id.
+
+    Returns (vmk_name, vlan_id_int, error_str).
+    """
+    import subprocess, tempfile, textwrap, re as _re, os
+    vc_host = vc_url.replace("https://","").replace("http://","").rstrip("/")
+
+    # Build portgroup block
+    if create_pg:
+        pg_block = textwrap.dedent(f"""\
+            $vds = Get-VDSwitch -Name '{vds_name}' -ErrorAction SilentlyContinue
+            if (-not $vds) {{ Write-Host 'ERROR:VDS_NOT_FOUND:{vds_name}'; exit }}
+            $old = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($old) {{
+                Get-VMHostNetworkAdapter -PortGroup $old -ErrorAction SilentlyContinue |
+                    Remove-VMHostNetworkAdapter -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-VDPortgroup -VDPortgroup $old -Confirm:$false -ErrorAction SilentlyContinue
+            }}
+            $pg = New-VDPortgroup -VDSwitch $vds -Name '{pg_name}' -VLanId {vlan_id} -ErrorAction SilentlyContinue
+            if (-not $pg) {{ Write-Host 'ERROR:PG_CREATE_FAILED'; exit }}
+        """)
+    else:
+        pg_block = textwrap.dedent(f"""\
+            $pg  = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $pg) {{ Write-Host 'ERROR:PG_NOT_FOUND:{pg_name}'; exit }}
+            $vds = $pg.VDSwitch
+        """)
+
+    excl_block = ""
+    if ip_to_exclude:
+        excl_block = textwrap.dedent(f"""\
+            $stale = Get-VMHostNetworkAdapter -VMHost $vmhost -ErrorAction SilentlyContinue |
+                         Where-Object {{ $_.IP -eq '{ip_to_exclude}' }}
+            if ($stale) {{
+                Write-Host "PRE_CLEAN:$($stale.Name)"
+                Remove-VMHostNetworkAdapter -NetworkAdapter $stale -Confirm:$false -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+            }}
+        """)
+
+    script = textwrap.dedent(f"""\
+        $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
+        $ErrorActionPreference = 'SilentlyContinue'
+        Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
+        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+        Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
+        $vmhost = Get-VMHost -Name '{host_name}' -ErrorAction SilentlyContinue
+        if (-not $vmhost) {{ Write-Host 'ERROR:VMHOST_NOT_FOUND'; exit }}
+        {excl_block}
+        {pg_block}
+        # Get VLAN ID from portgroup
+        $vlanCfg = $pg.VlanConfiguration
+        $vlanId  = if ($vlanCfg -ne $null -and $vlanCfg.VlanId -ne $null) {{ $vlanCfg.VlanId }} else {{ 0 }}
+        Write-Host "VLAN_ID:$vlanId"
+        # Find the custom stack (must already exist — created via esxcli before this call)
+        $stack = Get-VMHostNetworkStack -VMHost $vmhost -ErrorAction SilentlyContinue |
+                     Where-Object {{ $_.Name -eq '{stack_name}' }}
+        if (-not $stack) {{ Write-Host 'ERROR:STACK_NOT_FOUND:{stack_name}'; exit }}
+        # Create vmk on the custom stack — NO -IP, caller sets IP via esxcli
+        $vmk = New-VMHostNetworkAdapter -VMHost $vmhost `
+                   -PortGroup $pg -VirtualSwitch $vds `
+                   -NetworkStack $stack `
+                   -ErrorAction SilentlyContinue
+        if (-not $vmk) {{ Write-Host 'ERROR:VMK_CREATE_FAILED'; exit }}
+        Write-Host "VMK_NAME:$($vmk.Name)"
+        Write-Host "STACK_VMK_DONE"
+        Disconnect-VIServer -Confirm:$false | Out-Null
+    """)
+    with tempfile.NamedTemporaryFile(suffix=".ps1", mode="w", delete=False, prefix="vmk_stack_") as f:
+        f.write(script); script_path = f.name
+    try:
+        env = __import__("os").environ.copy()
+        env["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"
+        env.setdefault("HOME", "/root")
+        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
+                           capture_output=True, text=True, timeout=120, env=env)
+        out = _re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', r.stdout + r.stderr)
+        if "STACK_VMK_DONE" not in out:
+            return None, None, f"PowerCLI vmk-on-stack failed:\n{out[:1500]}"
+        vmk_name = vlan_id_out = None
+        for line in out.splitlines():
+            if line.startswith("VMK_NAME:"): vmk_name = line.split(":",1)[1].strip()
+            if line.startswith("VLAN_ID:"):
+                try: vlan_id_out = int(line.split(":",1)[1].strip())
+                except: vlan_id_out = 0
+            if line.startswith("ERROR:"):
+                return None, None, line[6:]
+        return vmk_name, (vlan_id_out or 0), ""
+    except subprocess.TimeoutExpired:
+        return None, None, "PowerCLI timed out (>120s)"
+    finally:
+        try: __import__("os").unlink(script_path)
+        except: pass
+
+
 def _pcli_dns_vmk_remove(vc_url, vc_user, vc_pass, host_fqdn, vmk_name, ip=""):
     """PowerCLI: remove the temp vmk created for the DNS check.
     Looks up by name (Where-Object pipe) AND by IP as fallback — both reliable."""
@@ -4611,14 +4715,128 @@ def _pcli_dns_vmk_remove(vc_url, vc_user, vc_pass, host_fqdn, vmk_name, ip=""):
         except Exception: pass
 
 
+def _pcli_setup_wld_vmk_dedicated_stack(vc_url, vc_user, vc_pass,
+                                          host_name, vds_name, pg_name, vlan_id,
+                                          ip, mask, stack_name):
+    """
+    Create DVPortGroup + vmk using New-VMHostNetworkAdapter (proven approach).
+    The vmk lands on the Default TCP/IP stack; correct routing is achieved by
+    the caller adding a temporary host route via SSH.
+    Returns (vmk_name, error_str).
+    """
+    import subprocess, tempfile, os, textwrap
+    vc_host = vc_url.replace("https://","").replace("http://","").rstrip("/")
+    script = textwrap.dedent(f"""\
+        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+        Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' | Out-Null
+
+        $vmhost = Get-VMHost -Name '{host_name}' -ErrorAction SilentlyContinue
+        if (-not $vmhost) {{ Write-Host 'ERROR:VMHOST_NOT_FOUND'; exit }}
+        $vds = Get-VDSwitch -Name '{vds_name}' -ErrorAction SilentlyContinue
+        if (-not $vds) {{ Write-Host 'ERROR:VDS_NOT_FOUND'; exit }}
+
+        # Remove any stale portgroup + its vmks
+        $old = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($old) {{
+            Get-VMHostNetworkAdapter -PortGroup $old -ErrorAction SilentlyContinue |
+                Remove-VMHostNetworkAdapter -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-VDPortgroup -VDPortgroup $old -Confirm:$false -ErrorAction SilentlyContinue
+        }}
+        # Also remove any stale vmk with same IP
+        Get-VMHostNetworkAdapter -VMHost $vmhost -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.IP -eq '{ip}' }} |
+            Remove-VMHostNetworkAdapter -Confirm:$false -ErrorAction SilentlyContinue
+
+        $pg = New-VDPortgroup -VDSwitch $vds -Name '{pg_name}' -VLanId {vlan_id} -ErrorAction SilentlyContinue
+        if (-not $pg) {{ Write-Host 'ERROR:PG_CREATE_FAILED'; exit }}
+
+        # Create vmk via New-VMHostNetworkAdapter (same approach as VLAN check — proven working)
+        $vmk = New-VMHostNetworkAdapter -VMHost $vmhost `
+            -PortGroup $pg -VirtualSwitch $vds `
+            -IP '{ip}' -SubnetMask '{mask}' `
+            -ErrorAction SilentlyContinue
+        if (-not $vmk) {{ Write-Host 'ERROR:VMK_CREATE_FAILED'; exit }}
+        Write-Host "VMK_NAME:$($vmk.Name)"
+        Disconnect-VIServer -Confirm:$false | Out-Null
+    """)
+    with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w") as f:
+        f.write(script); fname = f.name
+    try:
+        r = subprocess.run(["pwsh", "-NonInteractive", "-NoProfile", "-File", fname],
+                           capture_output=True, text=True, timeout=90)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("ERROR:"):
+                return None, line[6:]
+            if line.startswith("VMK_NAME:"):
+                val = line[9:].strip()
+                return (val, None) if val else (None, "Empty vmk name")
+        return None, f"No VMK_NAME in output. stdout={r.stdout[:400]} stderr={r.stderr[:200]}"
+    except Exception as e:
+        return None, str(e)
+    finally:
+        try: os.unlink(fname)
+        except: pass
+
+
+def _pcli_get_pg_vlan(vc_url, vc_user, vc_pass, pg_name, pg_moref=None):
+    """Return the integer VLAN ID of a DVPortGroup.
+    NOTE: $pg.VLanId is unreliable (often empty).
+    The correct path is ExtensionData.Config.DefaultPortConfig.Vlan.VlanId.
+    Uses Get-VDPortgroup -Name (confirmed working); moref is kept for future use."""
+    import subprocess, tempfile, os, textwrap
+    vc_host = vc_url.replace("https://","").replace("http://","").rstrip("/")
+    # Always use -Name lookup: confirmed to return correct ExtensionData VLAN
+    lookup = pg_name or pg_moref or ""
+    if not lookup:
+        return None
+    # Use -Name if we have it (more human-readable in logs); if only moref, try -Id
+    if pg_name:
+        pg_selector = f"-Name '{pg_name}'"
+    else:
+        pg_selector = f"-Id '{pg_moref}'"
+    script = textwrap.dedent(f"""\
+        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+        Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' | Out-Null
+        $pg = Get-VDPortgroup {pg_selector} -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pg) {{
+            $pg.ExtensionData.Config.DefaultPortConfig.Vlan.VlanId
+        }}
+        Disconnect-VIServer -Confirm:$false | Out-Null
+    """)
+    with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w") as f:
+        f.write(script); fname = f.name
+    try:
+        r = subprocess.run(["pwsh", "-NonInteractive", "-NoProfile", "-File", fname],
+                           capture_output=True, text=True, timeout=45)
+        for line in reversed(r.stdout.strip().splitlines()):
+            line = line.strip()
+            if line.lstrip("-").isdigit():
+                return int(line)
+        return None
+    except Exception:
+        return None
+    finally:
+        try: os.unlink(fname)
+        except: pass
+
+
 @app.route("/api/dns-check-hosts", methods=["POST"])
 def dns_check_hosts():
-    """Return ESX hosts in a given cluster for the DNS check host selector."""
+    """Return ESX hosts in a given cluster for the DNS check host selector.
+    Also returns preview data: management PG VLAN, workload DVLAN VLAN + first available IP.
+    """
     body       = request.get_json(force=True)
     vc_url     = normalize_url(body.get("vc_url", ""))
     vc_user    = body.get("vc_user", "") or body.get("username", "")
     vc_pass    = body.get("vc_pass", "") or body.get("password", "")
     cluster_id = body.get("cluster_moref", "")
+    pg_name    = (body.get("port_group_name") or "").strip()
+    pg_moref   = (body.get("port_group_id")   or "").strip()   # e.g. "dvportgroup-24"
+    nsx_raw    = (body.get("nsx_url") or "").strip()
+    nsx_url    = normalize_url(nsx_raw) if nsx_raw else guess_nsx_url(vc_url)
+    nsx_user   = body.get("nsx_user", "")
+    nsx_pass   = body.get("nsx_pass", "")
     try:
         token, _ = vc_auth(vc_url, vc_user, vc_pass)
         raw   = vc_get(vc_url, token, "/api/vcenter/host",
@@ -4626,7 +4844,49 @@ def dns_check_hosts():
         hosts = [{"name": h.get("name", ""),
                   "short": (h.get("name", "")).split(".")[0]}
                  for h in raw if h.get("name")]
-        return jsonify({"hosts": hosts})
+
+        # ── Preview: management portgroup VLAN ──────────────────────────────
+        mgt_vlan = None
+        if pg_moref or pg_name:
+            try: mgt_vlan = _pcli_get_pg_vlan(vc_url, vc_user, vc_pass, pg_name, pg_moref)
+            except Exception: pass
+
+        # ── Preview: workload DVLAN VLAN + first available temp IP ──────────
+        wld_vlan = None; wld_preview_ip = None; wld_gateway = None
+        if nsx_url and nsx_user and nsx_pass:
+            try:
+                import ipaddress as _ip
+                _dvlans = (nsx_get(nsx_url, nsx_user, nsx_pass,
+                    "/policy/api/v1/infra/distributed-vlan-connections") or {}).get("results", [])
+                if _dvlans:
+                    _dv = _dvlans[0]
+                    wld_vlan = _dv.get("vlan_id")
+                    _gws = _dv.get("gateway_addresses") or []
+                    if _gws:
+                        _gw_cidr  = _gws[0]
+                        wld_gateway = _gw_cidr.split("/")[0]
+                        _wld_net  = _ip.ip_interface(_gw_cidr).network
+                        _blks = (nsx_get(nsx_url, nsx_user, nsx_pass,
+                            "/policy/api/v1/infra/ip-blocks") or {}).get("results", [])
+                        for _b in _blks:
+                            if (_b.get("visibility") or "").upper() != "EXTERNAL":
+                                continue
+                            _cidr = _block_cidr(_b, nsx_url, nsx_user, nsx_pass)
+                            try:
+                                if _cidr and _ip.ip_network(_cidr, strict=False).overlaps(_wld_net):
+                                    _fb  = nsx_get(nsx_url, nsx_user, nsx_pass,
+                                        f"/policy/api/v1/infra/ip-blocks/{_b.get('id','')}") or _b
+                                    _ips = _pick_temp_ips(_cidr, _gw_cidr, _nsx_excl_to_str(_fb), 1)
+                                    if _ips: wld_preview_ip = _ips[0]
+                                    break
+                            except Exception: pass
+            except Exception: pass
+
+        return jsonify({"hosts": hosts,
+                        "mgt_vlan": mgt_vlan,
+                        "wld_vlan": wld_vlan,
+                        "wld_preview_ip": wld_preview_ip,
+                        "wld_gateway": wld_gateway})
     except Exception as e:
         return jsonify({"hosts": [], "error": str(e)})
 
@@ -4671,6 +4931,11 @@ def check_dns_connectivity():
         "gw_ping": None, "dns_ping": None, "dns_resolve": None,
         "gw_ping_output": "", "dns_ping_output": "", "dns_resolve_output": "",
         "dns_domain": "",
+        # Workload DNS test results
+        "wld_vmk": "", "wld_vlan_id": None, "wld_ip_used": "", "wld_gateway": "",
+        "wld_gw_ping": None, "wld_dns_ping": None, "wld_dns_resolve": None,
+        "wld_gw_ping_output": "", "wld_dns_ping_output": "", "wld_dns_resolve_output": "",
+        "wld_dns_domain": "", "wld_error": "",
     }
     vmk_name = None; host_name = ""; ssh_was_on = None
     vmk_removed_via_ssh = False   # always defined — referenced in outer finally
@@ -4699,16 +4964,61 @@ def check_dns_connectivity():
         if not ssh_was_on:
             _time.sleep(5)
 
-        # Create temp vmk (pre-cleans any stale vmk with same IP automatically)
-        vmk_name, vlan_id, pcli_err = _pcli_dns_vmk_create(
-            vc_url, vc_user, vc_pass, pg_name, host_name, first_ip, prefix)
+        # ── Management DNS test — custom TCP/IP stack approach ────────────────
+        # Flow (mirrors the user-validated manual sequence):
+        #  1. SSH conn-1: remove stale stack (if any) + create fresh custom stack
+        #     (ESXi may drop this SSH session when the netstack changes — that's OK)
+        #  2. PowerCLI: New-VMHostNetworkAdapter -NetworkStack $MyStack (no -IP)
+        #  3. SSH conn-2 (fresh): set IP + add default route on stack + run tests
+        #     (vmkping -S <stack> reaches cross-subnet DNS via the default route)
+        #  4. SSH conn-2 finally: remove vmk + stack; PowerCLI outer finally removes
+        #     the portgroup only if needed.
+        # ──────────────────────────────────────────────────────────────────────
+        import ipaddress as _ipa
+        mgt_stack = "vcf-dns-mgt-chk"
+        mask      = str(_ipa.IPv4Network(f"0.0.0.0/{prefix}").netmask)
+
+        # Step 1 — SSH conn-1: create the custom stack
+        _ssh1 = _para.SSHClient()
+        _ssh1.set_missing_host_key_policy(_para.AutoAddPolicy())
+        for _att in range(6):
+            try:
+                _ssh1.connect(host_name, username="root", password=esx_pass, timeout=10)
+                break
+            except _para.AuthenticationException:
+                raise RuntimeError(
+                    f"ESX root password incorrect for {host_name}. "
+                    "Please enter the correct password and run again.")
+            except Exception:
+                if _att < 5: _time.sleep(2)
+                else: raise RuntimeError(
+                    f"Cannot reach {host_name} via SSH. "
+                    "Check that port 22 is reachable from this VM.")
+        try:
+            _ssh1.exec_command(
+                f"esxcli network ip netstack remove -N {mgt_stack} 2>/dev/null",
+                timeout=10)[1].read()
+            _time.sleep(1)
+            _ssh1.exec_command(
+                f"esxcli network ip netstack add -N {mgt_stack} 2>/dev/null",
+                timeout=15)[1].read()
+        finally:
+            try: _ssh1.close()
+            except: pass
+        _time.sleep(5)   # wait for ESXi to settle after netstack add
+
+        # Step 2 — PowerCLI: create vmk on the custom stack (no IP assigned yet)
+        vmk_name, vlan_id, pcli_err = _pcli_vmk_on_stack(
+            vc_url, vc_user, vc_pass, host_name, pg_name, mgt_stack,
+            create_pg=False, ip_to_exclude=first_ip)
         if pcli_err:
-            result["error"] = f"PowerCLI setup failed: {pcli_err}"
+            result["error"] = f"PowerCLI vmk-on-stack failed: {pcli_err}"
             return jsonify(result)
         result["vmk"]     = vmk_name or ""
         result["vlan_id"] = vlan_id
-        _time.sleep(3)
+        _time.sleep(2)
 
+        # Step 3 — SSH conn-2: set IP + route + tests
         ssh_client = _para.SSHClient()
         ssh_client.set_missing_host_key_policy(_para.AutoAddPolicy())
         try:
@@ -4731,14 +5041,26 @@ def check_dns_connectivity():
                 _, so, se = ssh_client.exec_command(cmd, timeout=timeout)
                 return so.read().decode("utf-8","replace"), se.read().decode("utf-8","replace")
 
-            # 1. Gateway ping
-            gw_out, gw_err = _run(f"vmkping -I {vmk_name} -c 3 -W 2 {gw_ip}", timeout=30)
+            # Configure IP and default route on the custom stack
+            _run(f"esxcli network ip interface ipv4 set"
+                 f" -i {vmk_name} -I {first_ip} -N {mask} -t static 2>/dev/null",
+                 timeout=10)
+            _run(f"esxcli network ip route ipv4 add"
+                 f" --gateway={gw_ip} --network=default -N {mgt_stack} 2>/dev/null",
+                 timeout=10)
+            _time.sleep(1)
+
+            # 1. Gateway ping — uses the stack's routing (same subnet → direct)
+            gw_out, gw_err = _run(
+                f"vmkping -S {mgt_stack} -c 3 -W 2 {gw_ip}", timeout=30)
             gw_pass = "0% packet loss" in gw_out or "bytes from" in gw_out
             result["gw_ping"]        = "pass" if gw_pass else "fail"
             result["gw_ping_output"] = (gw_out + gw_err).strip()
 
-            # 2. DNS server reachability ping
-            dn_out, dn_err = _run(f"vmkping -I {vmk_name} -c 3 -W 2 {dns_ip}", timeout=30)
+            # 2. DNS server ping — uses the stack's default route, so it reaches
+            #    the DNS server even when it's cross-subnet (no /32 hack needed).
+            dn_out, dn_err = _run(
+                f"vmkping -S {mgt_stack} -c 3 -W 2 {dns_ip}", timeout=30)
             dn_pass = "0% packet loss" in dn_out or "bytes from" in dn_out
             result["dns_ping"]        = "pass" if dn_pass else "fail"
             result["dns_ping_output"] = (dn_out + dn_err).strip()
@@ -4826,17 +5148,238 @@ def check_dns_connectivity():
             result["success"] = True
 
         finally:
-            # Primary vmk cleanup: esxcli runs in the SSH finally block so it
-            # executes whether the tests passed, failed, or raised an exception —
-            # as long as the SSH connection was established.
+            # Primary cleanup: remove vmk then custom stack via esxcli.
+            # Runs whether tests passed, failed, or raised — SSH conn-2 is still open.
             if vmk_name:
                 try:
                     _run(f"esxcli network ip interface remove -i {vmk_name}", timeout=15)
                     vmk_removed_via_ssh = True
-                except Exception:
-                    pass
+                except Exception: pass
+            try:
+                _run(f"esxcli network ip netstack remove -N {mgt_stack}", timeout=15)
+            except Exception: pass
             try: ssh_client.close()
             except Exception: pass
+
+        # ══════════════════════════════════════════════════════════════════════
+        # WORKLOAD DNS TEST
+        # Uses a DEDICATED TCP/IP stack so routing goes through the workload
+        # gateway (not the management gateway), correctly simulating what
+        # Supervisor pods will do.
+        #
+        # Flow:
+        #  1. NSX  → DVLAN info + temp IP from External IP Block
+        #  2. PowerCLI → create DVPortGroup only (returns portgroup moref key)
+        #  3. SSH/esxcli → create custom netstack + attach vmk + set IP + route
+        #  4. SSH → vmkping gateway, vmkping DNS, nslookup github.com
+        #  5. SSH/esxcli → remove vmk + custom stack
+        #  6. PowerCLI → remove portgroup
+        # ══════════════════════════════════════════════════════════════════════
+        import ipaddress as _ip2
+        _nsx_raw      = (body.get("nsx_url") or "").strip()
+        _nsx_url      = normalize_url(_nsx_raw) if _nsx_raw else guess_nsx_url(vc_url)
+        _nsx_user     = body.get("nsx_user", "") or vc_user
+        _nsx_pass     = body.get("nsx_pass", "") or vc_pass
+        _dns_wld_raw  = body.get("dns_servers_workload", "") or dns_raw
+        _dns_wld      = [s.strip() for s in re.split(r'[,\s]+', _dns_wld_raw) if s.strip()] or dns_list
+
+        wld_pg_name  = None; wld_vmk_name = None; wld_temp_ip = ""
+        wld_stack    = "vcf-dns-wld-chk"
+
+        try:
+            # ── 1. DVLAN connection details ──────────────────────────────────
+            _dvlans = (nsx_get(_nsx_url, _nsx_user, _nsx_pass,
+                "/policy/api/v1/infra/distributed-vlan-connections") or {}).get("results", [])
+            if not _dvlans:
+                result["wld_error"] = (
+                    "No Distributed External Connection found — "
+                    "run 'Check Distributed External Connection' first.")
+            else:
+                _dvlan       = _dvlans[0]
+                _wld_vlan    = _dvlan.get("vlan_id", 0)
+                _wld_gw_list = _dvlan.get("gateway_addresses") or []
+                if not _wld_gw_list:
+                    result["wld_error"] = "DVLAN has no gateway address — check NSX config."
+                else:
+                    _wld_gw_cidr = _wld_gw_list[0]
+                    _wld_gw_ip   = _wld_gw_cidr.split("/")[0]
+                    _wld_prefix  = int(_wld_gw_cidr.split("/")[1])
+                    _wld_mask    = str(_ip2.IPv4Network(f"0.0.0.0/{_wld_prefix}").netmask)
+                    _wld_net     = _ip2.ip_interface(_wld_gw_cidr).network
+
+                    # ── 2. NSX VDS name ──────────────────────────────────────
+                    _htns = (nsx_get(_nsx_url, _nsx_user, _nsx_pass,
+                        "/policy/api/v1/infra/sites/default/enforcement-points"
+                        "/default/host-transport-nodes") or {}).get("results", [])
+                    _nsx_vds = ""
+                    for _h in _htns:
+                        for _hs in (_h.get("host_switch_spec") or {}).get("host_switches") or []:
+                            _nsx_vds = _hs.get("host_switch_name", "")
+                            if _nsx_vds: break
+                        if _nsx_vds: break
+                    if not _nsx_vds:
+                        result["wld_error"] = "Could not determine NSX VDS name."
+                    else:
+                        # ── 3. External IP Block ──────────────────────────────
+                        _all_blocks = (nsx_get(_nsx_url, _nsx_user, _nsx_pass,
+                            "/policy/api/v1/infra/ip-blocks") or {}).get("results", [])
+                        _blk_cidr = None; _blk_excl = None
+                        for _b in _all_blocks:
+                            if (_b.get("visibility") or "").upper() != "EXTERNAL":
+                                continue
+                            _cidr2 = _block_cidr(_b, _nsx_url, _nsx_user, _nsx_pass)
+                            try:
+                                if _cidr2 and _ip2.ip_network(_cidr2, strict=False).overlaps(_wld_net):
+                                    _blk_cidr = _cidr2
+                                    _full_b   = nsx_get(_nsx_url, _nsx_user, _nsx_pass,
+                                        f"/policy/api/v1/infra/ip-blocks/{_b.get('id','')}") or _b
+                                    _blk_excl = _nsx_excl_to_str(_full_b)
+                                    break
+                            except Exception: pass
+                        if not _blk_cidr:
+                            result["wld_error"] = "No External IP Block found overlapping the DVLAN subnet."
+                        else:
+                            _wld_ips = _pick_temp_ips(_blk_cidr, _wld_gw_cidr, _blk_excl, 1)
+                            if not _wld_ips:
+                                result["wld_error"] = "No available IP in External IP Block."
+                            else:
+                                wld_temp_ip  = _wld_ips[0]
+                                wld_pg_name  = f"vcf-dns-wld-check-{_wld_vlan}"
+                                result["wld_vlan_id"] = _wld_vlan
+                                result["wld_ip_used"] = wld_temp_ip
+                                result["wld_gateway"] = _wld_gw_ip
+
+                                # ── 4. SSH conn-w1: create custom workload stack ─
+                                wld_stack = "vcf-dns-wld-chk"
+                                _wld_ssh1 = _para.SSHClient()
+                                _wld_ssh1.set_missing_host_key_policy(_para.AutoAddPolicy())
+                                try:
+                                    _wld_ssh1.connect(host_name, username="root",
+                                                      password=esx_pass, timeout=10)
+                                    _wld_ssh1.exec_command(
+                                        f"esxcli network ip netstack remove"
+                                        f" -N {wld_stack} 2>/dev/null",
+                                        timeout=10)[1].read()
+                                    _time.sleep(1)
+                                    _wld_ssh1.exec_command(
+                                        f"esxcli network ip netstack add"
+                                        f" -N {wld_stack} 2>/dev/null",
+                                        timeout=15)[1].read()
+                                finally:
+                                    try: _wld_ssh1.close()
+                                    except: pass
+                                _time.sleep(5)
+
+                                # ── 5. PowerCLI: create portgroup + vmk on stack ─
+                                wld_vmk_name, _, _pg_err = _pcli_vmk_on_stack(
+                                    vc_url, vc_user, vc_pass, host_name,
+                                    wld_pg_name, wld_stack,
+                                    create_pg=True, vds_name=_nsx_vds,
+                                    vlan_id=_wld_vlan,
+                                    ip_to_exclude=wld_temp_ip)
+                                if _pg_err:
+                                    result["wld_error"] = f"PowerCLI vmk-on-stack failed: {_pg_err}"
+                                else:
+                                    result["wld_vmk"] = wld_vmk_name
+                                    _time.sleep(2)
+
+                                    # ── 6. SSH conn-w2: IP + route + tests ───────
+                                    _wld_ssh = _para.SSHClient()
+                                    _wld_ssh.set_missing_host_key_policy(_para.AutoAddPolicy())
+                                    try:
+                                        for _att in range(4):
+                                            try:
+                                                _wld_ssh.connect(host_name, username="root",
+                                                                 password=esx_pass, timeout=10)
+                                                break
+                                            except _para.AuthenticationException:
+                                                raise RuntimeError(
+                                                    f"ESX root password incorrect for {host_name}.")
+                                            except Exception:
+                                                if _att < 3: _time.sleep(2)
+                                                else: raise RuntimeError(
+                                                    f"Cannot SSH to {host_name}.")
+
+                                        def _wrun(cmd, timeout=30):
+                                            _, _so, _se = _wld_ssh.exec_command(cmd, timeout=timeout)
+                                            return (_so.read().decode("utf-8","replace"),
+                                                    _se.read().decode("utf-8","replace"))
+
+                                        # Set IP on vmk + add default route on stack
+                                        _wrun(f"esxcli network ip interface ipv4 set"
+                                              f" -i {wld_vmk_name} -I {wld_temp_ip}"
+                                              f" -N {_wld_mask} -t static 2>/dev/null",
+                                              timeout=10)
+                                        _wrun(f"esxcli network ip route ipv4 add"
+                                              f" --gateway={_wld_gw_ip} --network=default"
+                                              f" -N {wld_stack} 2>/dev/null",
+                                              timeout=10)
+                                        _time.sleep(1)
+
+                                        # ── 7. Tests using -S <stack> ─────────────
+                                        _dns_wld_ip = _dns_wld[0] if _dns_wld else dns_ip
+
+                                        # a. Ping workload gateway
+                                        _wgw_o, _wgw_e = _wrun(
+                                            f"vmkping -S {wld_stack} -c 3 -W 2 {_wld_gw_ip}",
+                                            timeout=30)
+                                        _wgw_pass = ("0% packet loss" in _wgw_o or
+                                                     "bytes from" in _wgw_o)
+                                        result["wld_gw_ping"]        = "pass" if _wgw_pass else "fail"
+                                        result["wld_gw_ping_output"] = (_wgw_o + _wgw_e).strip()
+
+                                        # b. Ping workload DNS server
+                                        #    Default route on stack routes via workload GW
+                                        _wdn_o, _wdn_e = _wrun(
+                                            f"vmkping -S {wld_stack} -c 3 -W 2 {_dns_wld_ip}",
+                                            timeout=30)
+                                        _wdn_pass = ("0% packet loss" in _wdn_o or
+                                                     "bytes from" in _wdn_o)
+                                        result["wld_dns_ping"]        = "pass" if _wdn_pass else "fail"
+                                        result["wld_dns_ping_output"] = (_wdn_o + _wdn_e).strip()
+
+                                        # c. DNS resolution: github.com
+                                        _wns_o, _wns_e = _wrun(
+                                            f"nslookup github.com {_dns_wld_ip} 2>&1", timeout=15)
+                                        if not _wns_o.strip():
+                                            _wns_o, _wns_e = _wrun(
+                                                f"busybox nslookup github.com {_dns_wld_ip} 2>&1",
+                                                timeout=15)
+                                        _wns_combined = (_wns_o + _wns_e).strip()
+                                        _wns_pass = (
+                                            "Name:"      in _wns_o and
+                                            "can't find" not in _wns_o and
+                                            "NXDOMAIN"   not in _wns_o and
+                                            "REFUSED"    not in _wns_o and
+                                            "timed out"  not in _wns_o.lower())
+                                        result["wld_dns_resolve"]        = "pass" if _wns_pass else "fail"
+                                        result["wld_dns_resolve_output"] = _wns_combined[:600]
+                                        result["wld_dns_domain"]         = "github.com"
+
+                                    finally:
+                                        # Cleanup: remove vmk + custom stack via esxcli
+                                        if wld_vmk_name:
+                                            try:
+                                                _wld_ssh.exec_command(
+                                                    f"esxcli network ip interface remove"
+                                                    f" -i {wld_vmk_name}", timeout=15)[1].read()
+                                            except Exception: pass
+                                        try:
+                                            _wld_ssh.exec_command(
+                                                f"esxcli network ip netstack remove"
+                                                f" -N {wld_stack}", timeout=15)[1].read()
+                                        except Exception: pass
+                                        try: _wld_ssh.close()
+                                        except Exception: pass
+
+        except Exception as _wld_exc:
+            if not result.get("wld_error"):
+                result["wld_error"] = str(_wld_exc)
+        finally:
+            # Always remove the temp workload portgroup via PowerCLI
+            if wld_pg_name and host_name:
+                try: _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, wld_pg_name, [host_name])
+                except Exception: pass
 
     except RuntimeError as e:
         result["error"] = str(e)
