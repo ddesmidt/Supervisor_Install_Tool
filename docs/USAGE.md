@@ -212,6 +212,10 @@ Select the storage policy for Supervisor control plane VMs. The list is filtered
 | Supervisor Name | A name for the Supervisor (e.g. `supervisor-wld01-a`) |
 | Management Network | The port group for the control plane management network — **auto-discovered** from the VNA node (Distributed) or Edge node (Centralized); shown with a green ✓ note when auto-filled |
 | Gateway / DNS / NTP | Also auto-populated from the VNA or Edge node's management interface configuration |
+| DNS Servers — Management | DNS servers for Supervisor VMs to resolve internal FQDNs (vCenter, NSX, ESX hosts) |
+| DNS Servers — Workload | DNS servers for Supervisor Pods and VKS clusters to resolve external FQDNs (e.g. `github.com`) |
+
+Once the port group, first IP, gateway, and both DNS fields are filled in, a **"Check DNS Connectivity"** button appears. See [Step 8 — Connectivity Test](#step-8--connectivity-test) for details — the same button and modal are available here to validate connectivity before deploying.
 
 ### Deployment Progress
 
@@ -292,7 +296,34 @@ The NSX response is cached in the page session. If you open the Topology modal f
 
 ---
 
-## Step 8 — Connectivity Test
+## Step 8 — Check DNS Connectivity
+
+The **"Check DNS Connectivity"** button appears in **Deploy Wizard Step 2** once the port group, first IP, gateway, and both DNS fields are filled in. It runs two independent test sets — one for the management network and one for the workload network — from a real ESX host using a temporary VMkernel adapter.
+
+### What it tests
+
+| Test set | VLAN | What is verified |
+|---|---|---|
+| **Management DNS** | Management port group VLAN | vmkping gateway · vmkping DNS server · nslookup vCenter FQDN |
+| **Workload DNS** | Workload Ext. Conn. DVLAN | vmkping gateway · vmkping DNS server · nslookup `github.com` |
+
+### How it works
+
+1. **Select an ESX host** from the dropdown (populated from the cluster) and enter its root password
+2. The tool temporarily enables SSH on the host if not already enabled
+3. **Management test** — creates a custom TCP/IP stack on the host, attaches a temp VMkernel in the management VLAN, assigns the first control-plane IP, adds a default route, then runs vmkping + nslookup
+4. **Workload test** — creates a temp VMkernel in the workload DVLAN using the first available External IP Block address, runs vmkping + nslookup for `github.com`
+5. Both VMkernels and the custom stack are always removed in a `finally` block; SSH is restored to its original state
+
+> The modal info banner shows the exact VLANs and IPs that will be used (fetched as preview data when the host list loads) so you can verify before running.
+
+### Button colour
+
+The "Check DNS Connectivity" button in the wizard turns **green** only when all 6 sub-tests pass (3 Management + 3 Workload), and **red** if any fail. It stays grey until the test is run.
+
+---
+
+## Step 9 — Connectivity Test
 
 Clicking **"Test"** on a VKS cluster row opens the **Connectivity Test** modal, which runs three groups of tests to verify network reachability between the Supervisor and the VKS cluster.
 
