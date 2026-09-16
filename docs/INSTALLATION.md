@@ -101,7 +101,15 @@ ls /opt/supervisor-check/
 # app.py  requirements.txt  supervisor-check.service  static/  templates/
 ```
 
-> **Font Awesome icons are bundled.** The repository includes Font Awesome 6 under `app/static/fa/` (CSS + webfonts), so the UI loads correctly in **air-gapped / offline environments** with no CDN access required. No extra installation step is needed — the files are copied as part of `cp -r app/* /opt/supervisor-check/`.
+> **All frontend assets are bundled — no internet access required.** The repository ships the full UI stack under `app/static/`:
+>
+> | File | Replaces |
+> |---|---|
+> | `static/clr-ui.min.css` | `unpkg.com/@clr/ui` (Clarity Design System) |
+> | `static/alpine.min.js` | `cdn.jsdelivr.net/npm/alpinejs` (Alpine.js) |
+> | `static/fa/` | `cdnjs.cloudflare.com/…/font-awesome` (Font Awesome 6) |
+>
+> All files are copied as part of `cp -r app/* /opt/supervisor-check/` — no extra step needed.
 
 ---
 
