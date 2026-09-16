@@ -1223,17 +1223,11 @@ def discover_install_options():
         try:
             dns = vc_get(vc_url, token, "/api/appliance/networking/dns/servers") or {}
             result["vc_defaults"]["dns_servers"] = dns.get("servers", [])
-            # Derive search domain from the resolved short name → need the FQDN
-            # Try the found VM name first, then fall back to parsing the NSX URL
+            # Search domain: always use the domain part of the vCenter FQDN the user entered.
+            # e.g. "vc-mgmt-a.site-a.vcf.lab" → "site-a.vcf.lab"
+            # If the user entered an IP, _url_is_ip is True → no domain available.
             _domain_src = ""
-            if _vc_short and "." not in _vc_short:
-                # We have the short name but not the full domain; try NSX URL as source
-                _nsx_host = (urlparse(nsx_url).hostname or "") if nsx_url else ""
-                _nsx_parts = _nsx_host.split(".")
-                if len(_nsx_parts) >= 3 and not _nsx_parts[0].replace("-","").isdigit():
-                    _domain_src = ".".join(_nsx_parts[1:])   # "site-a.vcf.lab"
-            else:
-                # URL was a FQDN like "vc-mgmt-a.site-a.vcf.lab"
+            if not _url_is_ip:
                 _parts = _url_host.split(".")
                 if len(_parts) >= 3:
                     _domain_src = ".".join(_parts[1:])
@@ -5171,7 +5165,7 @@ def check_dns_connectivity():
         #  1. NSX  → DVLAN info + temp IP from External IP Block
         #  2. PowerCLI → create DVPortGroup only (returns portgroup moref key)
         #  3. SSH/esxcli → create custom netstack + attach vmk + set IP + route
-        #  4. SSH → vmkping gateway, vmkping DNS, nslookup github.com
+        #  4. SSH → vmkping gateway, vmkping DNS, nslookup <wld_test_host>
         #  5. SSH/esxcli → remove vmk + custom stack
         #  6. PowerCLI → remove portgroup
         # ══════════════════════════════════════════════════════════════════════
@@ -5182,6 +5176,7 @@ def check_dns_connectivity():
         _nsx_pass     = body.get("nsx_pass", "") or vc_pass
         _dns_wld_raw  = body.get("dns_servers_workload", "") or dns_raw
         _dns_wld      = [s.strip() for s in re.split(r'[,\s]+', _dns_wld_raw) if s.strip()] or dns_list
+        _wld_test_host = (body.get("dns_workload_test_host") or "github.com").strip() or "github.com"
 
         wld_pg_name  = None; wld_vmk_name = None; wld_temp_ip = ""
         wld_stack    = "vcf-dns-wld-chk"
@@ -5338,12 +5333,12 @@ def check_dns_connectivity():
                                         result["wld_dns_ping"]        = "pass" if _wdn_pass else "fail"
                                         result["wld_dns_ping_output"] = (_wdn_o + _wdn_e).strip()
 
-                                        # c. DNS resolution: github.com
+                                        # c. DNS resolution: user-configurable test host (default github.com)
                                         _wns_o, _wns_e = _wrun(
-                                            f"nslookup github.com {_dns_wld_ip} 2>&1", timeout=15)
+                                            f"nslookup {_wld_test_host} {_dns_wld_ip} 2>&1", timeout=15)
                                         if not _wns_o.strip():
                                             _wns_o, _wns_e = _wrun(
-                                                f"busybox nslookup github.com {_dns_wld_ip} 2>&1",
+                                                f"busybox nslookup {_wld_test_host} {_dns_wld_ip} 2>&1",
                                                 timeout=15)
                                         _wns_combined = (_wns_o + _wns_e).strip()
                                         _wns_pass = (
@@ -5354,7 +5349,7 @@ def check_dns_connectivity():
                                             "timed out"  not in _wns_o.lower())
                                         result["wld_dns_resolve"]        = "pass" if _wns_pass else "fail"
                                         result["wld_dns_resolve_output"] = _wns_combined[:600]
-                                        result["wld_dns_domain"]         = "github.com"
+                                        result["wld_dns_domain"]         = _wld_test_host
 
                                     finally:
                                         # Cleanup: remove vmk + custom stack via esxcli

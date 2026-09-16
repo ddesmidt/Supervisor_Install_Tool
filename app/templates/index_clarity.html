@@ -8,7 +8,7 @@
   <!-- Clarity Design System CSS -->
   <link rel="stylesheet" href="https://unpkg.com/@clr/ui@13.0.0/clr-ui.min.css">
   <!-- Font Awesome icons -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <link rel="stylesheet" href="/static/fa/css/all.min.css">
   <!-- Alpine.js -->
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 
@@ -1513,17 +1513,28 @@
                   </label>
                   <div class="clr-control-container"><div class="clr-select-wrapper">
                     <select x-model="wizardConfig.port_group_id" class="clr-select"
-                            @change="wizardConfig.port_group_id !== ((wizardOptions && wizardOptions.vc_defaults && wizardOptions.vc_defaults.vc_pg_id) || '') && (wizardConfig.gateway_cidr = '')">
+                            @change="
+                              const _vcPg = wizardOptions?.vc_defaults?.vc_pg_id || '';
+                              const _ndPg = wizardOptions?.node_pg_id  || '';
+                              if      (wizardConfig.port_group_id === _vcPg && wizardOptions?.vc_pg_gateway)  { wizardConfig.gateway_cidr = wizardOptions.vc_pg_gateway; }
+                              else if (wizardConfig.port_group_id === _ndPg && wizardOptions?.node_pg_gateway) { wizardConfig.gateway_cidr = wizardOptions.node_pg_gateway; }
+                              else { wizardConfig.gateway_cidr = ''; }
+                            ">
                       <option value="">— Select port group —</option>
                       <template x-for="pg in (wizardOptions ? wizardOptions.port_groups : [])" :key="pg.network">
                         <option :value="pg.network" x-text="pg.name + ' (' + pg.network + ')'"></option>
                       </template>
                     </select>
                   </div></div>
-                  <p x-show="wizardOptions && wizardOptions.vc_defaults && wizardOptions.vc_defaults.vc_pg_id && wizardConfig.port_group_id === wizardOptions.vc_defaults.vc_pg_id"
+                  <p x-show="wizardOptions?.vc_defaults?.vc_pg_id && wizardConfig.port_group_id === wizardOptions.vc_defaults.vc_pg_id"
                      style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
                     <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
                     Auto-discovered from vCenter VM
+                  </p>
+                  <p x-show="wizardOptions?.node_pg_id && wizardConfig.port_group_id === wizardOptions.node_pg_id && wizardConfig.port_group_id !== (wizardOptions?.vc_defaults?.vc_pg_id || '')"
+                     style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
+                    <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
+                    Auto-discovered from <span x-text="wizardOptions.node_pg_source || 'Node'"></span>
                   </p>
                 </div>
 
@@ -1552,8 +1563,8 @@
                   </div>
                 </div>
 
-                <div class="clr-row">
-                  <div class="clr-col-12 clr-col-md-6">
+                <div class="clr-row" style="align-items:flex-start;">
+                  <div class="clr-col-12 clr-col-md-5">
                     <div class="clr-form-control" style="margin-bottom:0.7rem;">
                       <label class="clr-control-label" style="font-size:0.68rem;">DNS Servers — Management <span style="font-weight:400; text-transform:none;">(comma-separated)</span></label>
                       <div class="clr-control-container"><div class="clr-input-wrapper">
@@ -1562,7 +1573,7 @@
                       <p style="font-size:0.62rem; color:#6e777b; margin-top:0.2rem;">For Supervisor VMs to resolve internal FQDNs (e.g. vCenter, NSX, ESX).</p>
                     </div>
                   </div>
-                  <div class="clr-col-12 clr-col-md-6">
+                  <div class="clr-col-12 clr-col-md-5">
                     <div class="clr-form-control" style="margin-bottom:0.7rem;">
                       <label class="clr-control-label" style="font-size:0.68rem;">DNS Servers — Workload <span style="font-weight:400; text-transform:none;">(comma-separated)</span></label>
                       <div class="clr-control-container"><div class="clr-input-wrapper">
@@ -1570,6 +1581,16 @@
                       </div></div>
                       <p style="font-size:0.62rem; color:#6e777b; margin-top:0.2rem;">For Supervisor Pods and VKS clusters to resolve external FQDNs (e.g. github.com).</p>
                     </div>
+                  </div>
+                  <!-- DNS architecture thumbnail — click to enlarge -->
+                  <div class="clr-col-12 clr-col-md-2" style="display:flex; align-items:center; justify-content:flex-end; padding-top:0.2rem;">
+                    <img src="/static/nsx-vpc-dns.jpg?v=2"
+                         alt="DNS architecture"
+                         title="Click to enlarge"
+                         @click="diagImg='/static/nsx-vpc-dns.jpg?v=2'; showDiagram=true; diagDrag.x=null; diagDrag.y=null;"
+                         style="max-height:68px; max-width:100%; border-radius:4px; border:1px solid #cdd3d8; cursor:pointer; opacity:0.85; transition:opacity 0.15s;"
+                         @mouseenter="$el.style.opacity='1'"
+                         @mouseleave="$el.style.opacity='0.85'">
                   </div>
                 </div>
 
@@ -3466,7 +3487,15 @@
                          <code x-text="dnsCheckModal.preview.wld_gateway || '?'"></code><br>
                       &nbsp;&nbsp;— Ping DNS
                          <code x-text="(wizardConfig.dns_servers_workload||wizardConfig.dns_servers||'').split(',')[0].trim()||'?'"></code>
-                         and resolve <code>github.com</code><br>
+                         and resolve
+                         <input type="text"
+                                x-model="wizardConfig.dns_workload_test_host"
+                                placeholder="github.com"
+                                style="display:inline; width:9rem; font-size:0.78rem; font-family:monospace;
+                                       border:none; border-bottom:1px solid #9aa0a6; background:transparent;
+                                       padding:0 2px; outline:none; color:#1a394e; vertical-align:baseline;"
+                                title="Hostname to resolve during the Workload DNS test"
+                                @click.stop><br>
                       <br>
                       · <strong>Remove the vmks and restore SSH state</strong>
                         (if SSH was enabled it stays enabled)
@@ -4106,7 +4135,7 @@
         cluster_moref: '', cluster_name: '',
         port_group_id: '',
         first_ip: '', gateway_cidr: '',
-        dns_servers: '', dns_servers_workload: '', search_domains: '', ntp_servers: '',
+        dns_servers: '', dns_servers_workload: '', dns_workload_test_host: 'github.com', search_domains: '', ntp_servers: '',
         storage_policy_uuid: '', storage_policy_name: '',
         nsx_project_path: '/orgs/default/projects/default',
         nsx_project_name: 'default',
@@ -4850,7 +4879,7 @@
           cluster_moref: '', cluster_name: '',
           port_group_id: '', port_group_name: '',
           first_ip: '', gateway_cidr: '',
-          dns_servers: '', dns_servers_workload: '', search_domains: '', ntp_servers: '',
+          dns_servers: '', dns_servers_workload: '', dns_workload_test_host: 'github.com', search_domains: '', ntp_servers: '',
           storage_policy_uuid: '', storage_policy_name: '',
           nsx_project_path: '/orgs/default/projects/default',
           nsx_project_name: 'default',
@@ -4877,18 +4906,36 @@
             const nodeD = (d.node_defaults || {})[dMode] || null;
             const vcD   = d.vc_defaults || {};
 
-            // Port Group: pre-select ONLY when vCenter VM is found in THIS vCenter
-            // (vc_pg_id is populated by backend only in that case)
-            const vcPgId = vcD.vc_pg_id || '';
+            // Port Group pre-population priority:
+            //  1. vCenter VM found in THIS vCenter (vc_pg_id set by backend)
+            //  2. VNA Node (NSX-Dist) or Edge Node (NSX-Cent) management PG as fallback
+            const vcPgId    = vcD.vc_pg_id   || '';
+            const vcPgGw    = vcD.gateway     || '';
+            const nodePgId  = (nodeD && nodeD.pg_id)        || '';
+            const nodePgGw  = (nodeD && nodeD.gateway_cidr) || '';
+            const nodeSrc   = dMode === 'distributed' ? 'VNA Node' : 'Edge Node';
+
             if (vcPgId) {
               this.wizardConfig.port_group_id   = vcPgId;
               this.wizardConfig.port_group_name = (d.port_groups || []).find(pg => pg.network === vcPgId)?.name || vcPgId;
-              // Gateway known because we know vCenter is on this PG
-              if (vcD.gateway) this.wizardConfig.gateway_cidr = vcD.gateway;
+              if (vcPgGw) this.wizardConfig.gateway_cidr = vcPgGw;
+            } else if (nodePgId) {
+              this.wizardConfig.port_group_id   = nodePgId;
+              this.wizardConfig.port_group_name = (nodeD && nodeD.pg_name) || nodePgId;
+              if (nodePgGw) this.wizardConfig.gateway_cidr = nodePgGw;
             }
-            // else: port_group_id and gateway_cidr stay blank
+            // else: stays blank
 
-            // DNS / NTP / Search Domain: prefer VNA/Edge node (NSX-sourced), fallback to vCenter appliance
+            // Store discovery hints in wizardOptions so the template can use them
+            this.wizardOptions = {
+              ...this.wizardOptions,
+              node_pg_id:      nodePgId,
+              node_pg_gateway: nodePgGw,
+              node_pg_source:  nodeSrc,
+              vc_pg_gateway:   vcPgGw,
+            };
+
+            // DNS / NTP: prefer VNA/Edge node (NSX-sourced), fallback to vCenter appliance
             if (nodeD) {
               if (nodeD.dns && nodeD.dns.length) {
                 this.wizardConfig.dns_servers          = nodeD.dns.join(', ');
@@ -4896,18 +4943,17 @@
               }
               if (nodeD.ntp && nodeD.ntp.length)
                 this.wizardConfig.ntp_servers = nodeD.ntp.join(', ');
-              if (nodeD.search_domain)
-                this.wizardConfig.search_domains = nodeD.search_domain;
             } else {
               if (vcD.dns_servers && vcD.dns_servers.length) {
                 this.wizardConfig.dns_servers          = vcD.dns_servers.join(', ');
                 this.wizardConfig.dns_servers_workload = vcD.dns_servers.join(', ');
               }
-              if (vcD.search_domains && vcD.search_domains.length)
-                this.wizardConfig.search_domains = vcD.search_domains.join(', ');
               if (vcD.ntp_servers && vcD.ntp_servers.length)
                 this.wizardConfig.ntp_servers = vcD.ntp_servers.join(', ');
             }
+            // Search Domain: always from vCenter FQDN (backend derives it from the URL the user typed)
+            if (vcD.search_domains && vcD.search_domains.length)
+              this.wizardConfig.search_domains = vcD.search_domains.join(', ');
             // Suggest name from vCenter hostname
             const host = this.form.vc_url.replace(/^https?:\/\//, '').split('.')[0];
             this.wizardConfig.name = 'supervisor-' + host.replace(/^vc-?/, '');
@@ -4916,7 +4962,15 @@
             const vcpsFromS7 = (s7Step && s7Step.valid_vcps_for_deploy) || null;
             const validProjs = vcpsFromS7 || d.valid_nsx_projects || [];
 
-            this.wizardOptions = { ...this.wizardOptions, valid_nsx_projects: validProjs };
+            this.wizardOptions = {
+              ...this.wizardOptions,
+              valid_nsx_projects: validProjs,
+              // preserve discovery hints set above (in case they were wiped by the spread)
+              node_pg_id:      nodePgId,
+              node_pg_gateway: nodePgGw,
+              node_pg_source:  nodeSrc,
+              vc_pg_gateway:   vcPgGw,
+            };
 
             // Wait for x-for to render the options before setting x-model value
             await this.$nextTick();
@@ -5804,8 +5858,9 @@
               port_group_name: pgName,
               first_ip:        this.wizardConfig.first_ip,
               gateway_cidr:    this.wizardConfig.gateway_cidr,
-              dns_servers:     this.wizardConfig.dns_servers,
-              dns_servers_workload: this.wizardConfig.dns_servers_workload,
+              dns_servers:              this.wizardConfig.dns_servers,
+              dns_servers_workload:     this.wizardConfig.dns_servers_workload,
+              dns_workload_test_host:   this.wizardConfig.dns_workload_test_host || 'github.com',
               vpc_connectivity_profile_path: this.wizardConfig.vpc_connectivity_profile_path,
               nsx_project_path: this.wizardConfig.nsx_project_path,
               search_domain:   this.wizardConfig.search_domains,
