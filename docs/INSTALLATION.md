@@ -98,8 +98,10 @@ cp -r app/* /opt/supervisor-check/
 
 # Verify structure
 ls /opt/supervisor-check/
-# app.py  requirements.txt  supervisor-check.service  templates/
+# app.py  requirements.txt  supervisor-check.service  static/  templates/
 ```
+
+> **Font Awesome icons are bundled.** The repository includes Font Awesome 6 under `app/static/fa/` (CSS + webfonts), so the UI loads correctly in **air-gapped / offline environments** with no CDN access required. No extra installation step is needed — the files are copied as part of `cp -r app/* /opt/supervisor-check/`.
 
 ---
 
@@ -179,6 +181,7 @@ git pull
 
 cp app/app.py /opt/supervisor-check/app.py
 cp app/templates/index_clarity.html /opt/supervisor-check/templates/index_clarity.html
+cp -r app/static/ /opt/supervisor-check/static/
 
 systemctl restart supervisor-check
 ```
