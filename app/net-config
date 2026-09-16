@@ -1,0 +1,152 @@
+#!/bin/bash
+# Network configuration helper for ens33 (Ubuntu 24.04 / netplan)
+
+IFACE="ens33"
+NETPLAN_FILE="/etc/netplan/99-net-config.sh.yaml"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
+BOLD='\033[1m'; RESET='\033[0m'
+
+current_ip()   { ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | head -1; }
+current_gw()   { ip route show default dev "$IFACE" 2>/dev/null | awk '{print $3}' | head -1; }
+current_dns()  { resolvectl status "$IFACE" 2>/dev/null | awk '/DNS Servers/{print $3}' | head -1; }
+is_dhcp() {
+    # Check if the active netplan config for this interface uses dhcp4: true
+    grep -q "dhcp4: true" /etc/netplan/*.yaml 2>/dev/null && \
+    ! grep -q "addresses:" /etc/netplan/*.yaml 2>/dev/null
+    return $?
+}
+
+show_status() {
+    echo ""
+    echo -e "${BOLD}=== Current Network Configuration (${IFACE}) ===${RESET}"
+    IP=$(current_ip)
+    GW=$(current_gw)
+    DNS=$(current_dns)
+
+    echo -e "  IP Address : ${CYAN}${IP:-none}${RESET}"
+    echo -e "  Gateway    : ${CYAN}${GW:-none}${RESET}"
+    echo -e "  DNS Server : ${CYAN}${DNS:-none}${RESET}"
+
+    if is_dhcp; then
+        echo -e "  Mode       : ${GREEN}DHCP${RESET}"
+    else
+        echo -e "  Mode       : ${CYAN}Static${RESET}"
+    fi
+    echo ""
+}
+
+apply_dhcp() {
+    echo -e "${CYAN}Switching to DHCP...${RESET}"
+    cat > "$NETPLAN_FILE" <<YAML
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${IFACE}:
+      dhcp4: true
+YAML
+    chmod 600 "$NETPLAN_FILE"
+    # Disable old cloud-init config to avoid conflict
+    if [ -f /etc/netplan/50-cloud-init.yaml ]; then
+        cat > /etc/netplan/50-cloud-init.yaml <<YAML
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${IFACE}:
+      dhcp4: true
+YAML
+        rm -f "$NETPLAN_FILE"
+    fi
+    netplan apply
+    echo -e "${GREEN}Done. New IP: $(current_ip)${RESET}"
+}
+
+apply_static() {
+    echo ""
+    # Read IP
+    while true; do
+        read -rp "  IP Address (e.g. 10.1.1.234): " S_IP
+        [[ "$S_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+        echo -e "${RED}  Invalid IP. Try again.${RESET}"
+    done
+
+    # Read prefix length
+    while true; do
+        read -rp "  Subnet prefix length (e.g. 24 for /24): " S_PREFIX
+        [[ "$S_PREFIX" =~ ^[0-9]+$ ]] && [ "$S_PREFIX" -ge 1 ] && [ "$S_PREFIX" -le 32 ] && break
+        echo -e "${RED}  Invalid prefix. Enter a number 1-32.${RESET}"
+    done
+
+    # Read gateway
+    while true; do
+        read -rp "  Gateway (e.g. 10.1.1.1): " S_GW
+        [[ "$S_GW" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+        echo -e "${RED}  Invalid gateway. Try again.${RESET}"
+    done
+
+    # Read DNS
+    while true; do
+        read -rp "  DNS Server (e.g. 10.1.1.1): " S_DNS
+        [[ "$S_DNS" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+        echo -e "${RED}  Invalid DNS. Try again.${RESET}"
+    done
+
+    echo ""
+    echo -e "${CYAN}Applying static configuration:${RESET}"
+    echo "  ${S_IP}/${S_PREFIX} gw ${S_GW} dns ${S_DNS}"
+
+    cat > /etc/netplan/50-cloud-init.yaml <<YAML
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${IFACE}:
+      dhcp4: false
+      addresses:
+        - ${S_IP}/${S_PREFIX}
+      routes:
+        - to: default
+          via: ${S_GW}
+      nameservers:
+        addresses:
+          - ${S_DNS}
+YAML
+    rm -f "$NETPLAN_FILE"
+    chmod 600 /etc/netplan/50-cloud-init.yaml
+
+    echo ""
+    echo -e "${BOLD}WARNING: If you change the IP, your SSH session will disconnect.${RESET}"
+    read -rp "  Apply now? [y/N]: " CONFIRM
+    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        netplan apply
+        echo -e "${GREEN}Done.${RESET}"
+        show_status
+    else
+        echo "Aborted. No changes applied."
+        rm -f /etc/netplan/50-cloud-init.yaml
+    fi
+}
+
+# ── main menu ─────────────────────────────────────────────────────────────────
+
+while true; do
+    show_status
+    echo -e "${BOLD}What would you like to do?${RESET}"
+    echo "  1) Switch to DHCP"
+    echo "  2) Set Static IP"
+    echo "  3) Refresh / Show current config"
+    echo "  q) Quit"
+    echo ""
+    read -rp "Choice: " CHOICE
+    case "$CHOICE" in
+        1) apply_dhcp ;;
+        2) apply_static ;;
+        3) ;;  # just loop and show_status again
+        q|Q) echo "Bye."; exit 0 ;;
+        *) echo -e "${RED}Invalid choice.${RESET}" ;;
+    esac
+done

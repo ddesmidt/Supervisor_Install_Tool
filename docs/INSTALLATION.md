@@ -105,7 +105,20 @@ ls /opt/supervisor-check/
 
 ---
 
-## Step 5 — Configure and Start the systemd Service
+## Step 5 — Install the Network Configuration Script
+
+The `net-config` helper script lets you switch the VM between DHCP and a static IP from the command line (no netplan knowledge required).
+
+```bash
+cp app/net-config /usr/local/bin/net-config
+chmod +x /usr/local/bin/net-config
+```
+
+See [Network Configuration Script](#network-configuration-script) for usage details.
+
+---
+
+## Step 6 — Configure and Start the systemd Service
 
 ```bash
 # Install the service unit
@@ -131,7 +144,7 @@ The app listens on **port 80** and starts automatically on boot.
 
 ---
 
-## Step 6 — Verify
+## Step 7 — Verify
 
 Open a browser and navigate to:
 
