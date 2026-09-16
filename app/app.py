@@ -6572,4 +6572,6 @@ def build_topology():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=80, debug=False)
+    import os as _os
+    _port = int(_os.environ.get("SUPERVISOR_CHECK_PORT", "80"))
+    app.run(host="0.0.0.0", port=_port, debug=False)

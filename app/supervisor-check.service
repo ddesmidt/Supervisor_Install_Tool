@@ -3,12 +3,14 @@ Description=vSphere Supervisor Readiness Check
 After=network.target
 
 [Service]
-Type=simple
-User=root
+Environment=HOME=/root
+Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 WorkingDirectory=/opt/supervisor-check
 ExecStart=/usr/bin/python3 app.py
 Restart=always
 RestartSec=5
+StandardOutput=append:/var/log/supervisor-check.log
+StandardError=append:/var/log/supervisor-check.log
 
 [Install]
 WantedBy=multi-user.target

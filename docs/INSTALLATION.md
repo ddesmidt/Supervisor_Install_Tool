@@ -148,7 +148,24 @@ Expected output:
      Active: active (running) since ...
 ```
 
-The app listens on **port 80** and starts automatically on boot.
+The app listens on **port 80** by default and starts automatically on boot.
+
+**To run on a different port**, add the `SUPERVISOR_CHECK_PORT` environment variable to the service file before installing it:
+
+```ini
+[Service]
+...
+Environment=SUPERVISOR_CHECK_PORT=8080
+```
+
+Or edit the installed unit directly:
+```bash
+systemctl edit supervisor-check   # adds an override drop-in
+# add:  Environment=SUPERVISOR_CHECK_PORT=8080
+systemctl daemon-reload && systemctl restart supervisor-check
+```
+
+Service logs are written to `/var/log/supervisor-check.log`.
 
 ---
 
@@ -159,6 +176,8 @@ Open a browser and navigate to:
 ```
 http://<VM-IP>/
 ```
+
+Replace `/` with `:<PORT>/` if you configured a custom port (e.g. `http://10.1.1.238:8080/`).
 
 You should see the **vSphere Supervisor Readiness Check + Installation** interface.
 
@@ -187,7 +206,7 @@ This uses `netplan` under the hood and applies changes immediately.
 | Start | `systemctl start supervisor-check` |
 | Stop | `systemctl stop supervisor-check` |
 | Restart | `systemctl restart supervisor-check` |
-| View logs | `journalctl -u supervisor-check -f` |
+| View logs | `journalctl -u supervisor-check -f` or `tail -f /var/log/supervisor-check.log` |
 | Disable autostart | `systemctl disable supervisor-check` |
 
 ---
