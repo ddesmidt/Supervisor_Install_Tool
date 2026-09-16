@@ -60,7 +60,12 @@ The tool displays three side-by-side columns — one per deployment mode — eac
 
 > **Broadcom employees:** A pre-built VM OVA with the application already installed is available on [Google Drive](https://drive.google.com/drive/folders/18pSjWNkDO_Xvin7IC3GqwO3maEQeEZNG).
 >
-> After deploying the OVA, the VM will obtain an IP via DHCP. To assign a static IP, log in as `root` (password: `VMware123!VMware123!`) and run the built-in `net-config` script — switch between DHCP and static. See [Network Configuration Script](docs/INSTALLATION.md#network-configuration-script) for details.
+> After deploying the OVA:
+> - **Network:** The VM will obtain an IP via DHCP. To assign a static IP, log in as `root` (password: `VMware123!VMware123!`) and run the built-in `net-config` script — switch between DHCP and static. See [Network Configuration Script](docs/INSTALLATION.md#network-configuration-script) for details.
+> - **Port:** The application listens on **TCP 80** by default. To change it, log in as `root` and run:
+>   ```bash
+>   /opt/supervisor-check/change-port.sh <port>
+>   ```
 >
 > Then open a browser and navigate to `http://<VM-IP>` to access the application.
 
