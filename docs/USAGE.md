@@ -204,8 +204,7 @@ Select the vSphere Zone (or compute cluster) to enable Supervisor on.
 |---|---|
 | NSX Project | Auto-populated from the valid VPC Connectivity Profile found in Step 7 |
 | VPC Connectivity Profile | Auto-populated; can be changed if multiple valid profiles exist |
-| First Control Plane IP | Enter the first of 5 consecutive IPs (e.g. `10.1.1.85` reserves `.85`–`.89`) |
-| Content Library | Select a vSphere Content Library for Supervisor VM images |
+| First Control Plane IP | Enter the first of 5 consecutive IPs (e.g. `10.1.1.85-10.1.1.89`) |
 
 ### Wizard Step 3 — Storage
 Select the storage policy for Supervisor control plane VMs. The list is filtered to policies compatible with the selected cluster's datastore type (VVol, PMem, and ESA policies are excluded unless the cluster supports them).
