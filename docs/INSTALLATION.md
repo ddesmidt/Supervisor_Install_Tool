@@ -227,7 +227,7 @@ cp -r app/static/ /opt/supervisor-check/static/
 systemctl restart supervisor-check
 ```
 
-> Flask caches Jinja2 templates in memory — always restart the service after updating `index.html`.
+> Flask caches Jinja2 templates in memory — always restart the service after updating `index_clarity.html`.
 
 ---
 
