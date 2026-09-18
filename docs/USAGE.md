@@ -190,9 +190,9 @@ The R5-4 fix wizard auto-populates fields from data already discovered during th
 
 Once all steps in a column are green, click **"Deploy Supervisor"** in that column.
 
-A 4-step wizard opens:
+A 5-step wizard opens:
 
-### Wizard Step 1 — vSphere Zone / Cluster
+### Wizard Step 1 — Cluster
 
 Select the vSphere Zone (or compute cluster) to enable Supervisor on.
 
@@ -200,27 +200,31 @@ Select the vSphere Zone (or compute cluster) to enable Supervisor on.
 - **No Zone configured**: a **cluster selector** is shown — choose the cluster directly. If only one cluster exists it is pre-selected.
 
 ### Wizard Step 2 — Network
+
+Two sections:
+
+**NSX Workload Network**
+
 | Field | Description |
 |---|---|
-| NSX Project | Auto-populated from the valid VPC Connectivity Profile found in Step 7 |
+| NSX Project | Auto-populated from the valid VPC Connectivity Profile |
 | VPC Connectivity Profile | Auto-populated; can be changed if multiple valid profiles exist |
-| First Control Plane IP | Enter the first of 5 consecutive IPs (e.g. `10.1.1.85-10.1.1.89`) |
 
-### Wizard Step 3 — Storage
-Select the storage policy for Supervisor control plane VMs. The list is filtered to policies compatible with the selected cluster's datastore type (VVol, PMem, and ESA policies are excluded unless the cluster supports them).
+**Supervisor Management Network**
 
-### Wizard Step 4 — Config
 | Field | Description |
 |---|---|
-| Supervisor Name | A name for the Supervisor (e.g. `supervisor-wld01-a`) |
-| Management Network | The port group for the control plane management network — **auto-discovered** from the VNA node (Distributed) or Edge node (Centralized); shown with a green ✓ note when auto-filled |
-| Gateway / DNS / NTP | Also auto-populated from the VNA or Edge node's management interface configuration |
-| DNS Servers — Management | DNS servers for Supervisor VMs to resolve internal FQDNs (vCenter, NSX, ESX hosts) |
-| DNS Servers — Workload | DNS servers for Supervisor Pods and VKS clusters to resolve external FQDNs (e.g. `github.com`) |
+| Port Group (management VLAN) | Auto-discovered from the VNA node (Distributed) or Edge node (Centralized) — shown with a green ✓ note; falls back to vCenter VM's port group |
+| Supervisor Control-Plane Mgt IPs | Enter the first of 5 consecutive IPs (e.g. `10.1.1.85-10.1.1.89`) |
+| Gateway (IP/prefix) | Auto-populated from VNA/Edge node management interface |
+| DNS Servers — Management | DNS servers for Supervisor VMs to resolve internal FQDNs (vCenter, NSX, ESX hosts) — auto-populated |
+| DNS Servers — Workload | DNS servers for Supervisor Pods and VKS clusters to resolve external FQDNs (e.g. `github.com`) — auto-populated |
+| Search Domain(s) | Auto-populated from VNA/Edge node |
+| NTP Servers | Auto-populated from VNA/Edge node |
 
 ### Optional: Check DNS Connectivity
 
-Once the port group, first IP, gateway, and both DNS fields are filled in, a **"Check DNS Connectivity"** button appears. It runs two independent test sets from a real ESX host using a temporary VMkernel adapter:
+Once the management network fields are filled in, a **"Check DNS Connectivity"** button appears. It runs two independent test sets from a real ESX host using a temporary VMkernel adapter:
 
 | Test set | VLAN | What is verified |
 |---|---|---|
@@ -235,6 +239,25 @@ Once the port group, first IP, gateway, and both DNS fields are filled in, a **"
 5. Both VMkernels are always removed in a `finally` block; SSH is restored to its original state
 
 The button turns **green** when all 6 sub-tests pass (3 Management + 3 Workload), **red** if any fail. The modal info banner shows the exact VLANs and IPs that will be used before you run the test.
+
+### Wizard Step 3 — Storage
+
+Select the storage policy for Supervisor control plane VMs. The list is filtered to policies compatible with the selected cluster — an info banner shows which cluster the policies are filtered for. An incompatible policy causes a silent EAM placement failure during deployment.
+
+### Wizard Step 4 — Config
+
+| Field | Description |
+|---|---|
+| Supervisor Name | A name for the Supervisor (e.g. `supervisor-mgmt-a`) |
+| Control Plane Size | `SMALL — 4 vCPU, 8 GB RAM` (recommended) |
+
+An info banner also displays the detected workload network mode and its Service CIDR / Private workload CIDR.
+
+### Wizard Step 5 — Review
+
+A summary table of all settings before deploying: Name, Cluster, Size, NSX Project, VPC Profile, Port Group, Control-Plane IPs, Gateway, DNS (Management), DNS (Workload), Search Domain, NTP, Storage Policy.
+
+Click **"Deploy"** to start the deployment.
 
 ### Deployment Progress
 
