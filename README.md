@@ -72,7 +72,7 @@ The tool displays three side-by-side columns — one per deployment mode — eac
 ### Prerequisites
 
 - A Linux VM inside your VCF environment with:
-  - Ubuntu 22.04+ or equivalent
+  - Ubuntu 22.04 LTS or Ubuntu 24.04 LTS (**not** 16.04/18.04 — Python too old)
   - Python 3.10+
   - Network access to vCenter and NSX Manager
 - VCF 9.1 environment with:

@@ -16,7 +16,8 @@ This guide walks through deploying the **vSphere Supervisor Readiness Check + In
 
 | Resource | Minimum |
 |---|---|
-| OS | Ubuntu 22.04 LTS or Ubuntu 24.04 LTS |
+| OS | **Ubuntu 22.04 LTS** or **Ubuntu 24.04 LTS** (Ubuntu 16.04 / 18.04 are **not supported** — Python is too old) |
+| Python | **3.10 or later** (Ubuntu 22.04 ships 3.10; Ubuntu 24.04 ships 3.12) |
 | CPU | 1 vCPU |
 | RAM | 2 GB |
 | Disk | 5 GB |
