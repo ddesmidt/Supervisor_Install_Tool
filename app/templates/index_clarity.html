@@ -1902,7 +1902,7 @@
                 <!-- Flex spacer — always pushes right-side buttons to the right -->
                 <div style="flex:1;"></div>
 
-                <!-- Check DNS Connectivity — step 2 only; grey → green/red after test -->
+                <!-- Check Network Connectivity — step 2 only; grey → green/red after test -->
                 <button x-show="wizardStep === 2 && wizardConfig.port_group_id && wizardConfig.first_ip && wizardConfig.gateway_cidr && wizardConfig.dns_servers"
                         :disabled="!!firstIpError()"
                         @click="dnsCheckModal.show = true; dnsCheckModal.done = false; dnsCheckModal.result = null; dnsCheckModal.error = ''; fetchDnsCheckHosts();"
@@ -1914,7 +1914,7 @@
                         }"
                         style="margin-right:0.5rem; font-size:0.76rem;">
                   <i :class="!dnsCheckModal.done ? 'fas fa-network-wired' : (dnsCheckModal.result && dnsCheckModal.result.gw_ping==='pass' && dnsCheckModal.result.dns_ping==='pass' && dnsCheckModal.result.dns_resolve==='pass' && !dnsCheckModal.result.wld_error && dnsCheckModal.result.wld_gw_ping==='pass' && dnsCheckModal.result.wld_dns_ping==='pass' && dnsCheckModal.result.wld_dns_resolve==='pass' ? 'fas fa-check-circle' : 'fas fa-times-circle')"
-                     style="font-size:0.68rem; margin-right:0.3rem;"></i>Check DNS Connectivity
+                     style="font-size:0.68rem; margin-right:0.3rem;"></i>Check Network Connectivity
                 </button>
 
                 <button x-show="wizardStep >= 1 && wizardStep < 5"
@@ -3503,7 +3503,7 @@
   </div>
 
 
-  <!-- ═══ Check DNS Connectivity modal ════════════════════════════════ -->
+  <!-- ═══ Check Network Connectivity modal ════════════════════════════ -->
   <div x-show="dnsCheckModal.show" x-cloak
        x-transition:enter="transition ease-out duration-200"
        x-transition:enter-start="opacity-0"
@@ -3522,7 +3522,7 @@
           </button>
           <h3 class="modal-title" style="font-size:1rem;">
             <i class="fas fa-network-wired" style="color:#0072a3; margin-right:0.4rem;"></i>
-            Check DNS Connectivity
+            Check Network Connectivity
           </h3>
         </div>
 
@@ -3556,23 +3556,29 @@
                       <strong>This tool will:</strong><br>
                       · <strong>Enable SSH temporarily</strong> if not already enabled<br>
                       <br>
-                      · <strong>Test DNS — Management</strong><br>
+                      · <strong>Test Network — Management</strong><br>
                       &nbsp;&nbsp;— Create a temp VMkernel in
                          VLAN <code x-text="dnsCheckModal.preview.mgt_vlan ?? '?'"></code>
                          with IP <code x-text="(wizardConfig.first_ip||'').split('-')[0]||'?'"></code><br>
                       &nbsp;&nbsp;— Ping gateway
                          <code x-text="wizardConfig.gateway_cidr ? wizardConfig.gateway_cidr.split('/')[0] : '?'"></code>
                          to verify layer-3 connectivity<br>
+                      &nbsp;&nbsp;— Ping NTP server
+                         <code x-text="(wizardConfig.ntp_servers||'').split(',')[0].trim()||'?'"></code>
+                         (no ability to send a real NTP request)<br>
                       &nbsp;&nbsp;— Ping DNS
                          <code x-text="(wizardConfig.dns_servers||'').split(',')[0].trim()||'?'"></code>
                          and resolve the vCenter FQDN<br>
                       <br>
-                      · <strong>Test DNS — Workload</strong><br>
+                      · <strong>Test Network — Workload</strong><br>
                       &nbsp;&nbsp;— Create a temp VMkernel in
                          VLAN <code x-text="dnsCheckModal.preview.wld_vlan ?? '?'"></code>
                          with IP <code x-text="dnsCheckModal.preview.wld_preview_ip || '?'"></code><br>
                       &nbsp;&nbsp;— Ping gateway
                          <code x-text="dnsCheckModal.preview.wld_gateway || '?'"></code><br>
+                      &nbsp;&nbsp;— Ping NTP server
+                         <code x-text="(wizardConfig.ntp_servers||'').split(',')[0].trim()||'?'"></code>
+                         (no ability to send a real NTP request)<br>
                       &nbsp;&nbsp;— Ping DNS
                          <code x-text="(wizardConfig.dns_servers_workload||wizardConfig.dns_servers||'').split(',')[0].trim()||'?'"></code>
                          and resolve
@@ -3657,8 +3663,8 @@
               <template x-if="!dnsCheckModal.error && dnsCheckModal.result">
                 <div x-data="{
                   get r()   { return dnsCheckModal.result; },
-                  get mgtOk()  { return this.r && this.r.gw_ping==='pass' && this.r.dns_ping==='pass' && this.r.dns_resolve==='pass'; },
-                  get wldOk()  { return this.r && this.r.wld_gw_ping==='pass' && this.r.wld_dns_ping==='pass' && this.r.wld_dns_resolve==='pass'; },
+                  get mgtOk()  { return this.r && this.r.gw_ping==='pass' && (this.r.mgt_ntp_check==='pass'||this.r.mgt_ntp_check==='skip'||!this.r.mgt_ntp_server) && this.r.dns_ping==='pass' && this.r.dns_resolve==='pass'; },
+                  get wldOk()  { return this.r && this.r.wld_gw_ping==='pass' && (this.r.wld_ntp_check==='pass'||this.r.wld_ntp_check==='skip'||!this.r.wld_ntp_server) && this.r.wld_dns_ping==='pass' && this.r.wld_dns_resolve==='pass'; },
                   get allPass(){ return this.mgtOk && (this.r.wld_error ? false : this.wldOk); }
                 }">
 
@@ -3689,6 +3695,21 @@
                             <span x-text="r.gw_ping==='pass'?'Reachable':'Not reachable'"></span>
                           </span>
                           <div x-show="r.gw_ping_output" style="font-size:0.72rem;color:#6e777b;font-family:monospace;margin-top:0.2rem;white-space:pre-wrap;max-height:4.5rem;overflow-y:auto;" x-text="r.gw_ping_output"></div>
+                        </td>
+                      </tr>
+                      <!-- NTP check row (management) -->
+                      <tr x-show="r.mgt_ntp_check != null && r.mgt_ntp_check !== 'skip'" style="border-bottom:1px solid #f0f0f0;">
+                        <td style="padding:0.4rem 0.7rem 0.4rem 0; white-space:nowrap; color:#2d3748; font-weight:600;">
+                          <i class="fas fa-clock" style="color:#6e777b; margin-right:0.4rem; font-size:0.78rem;"></i>
+                          NTP reachability
+                          <span style="font-weight:400; color:#6e777b;" x-text="r.mgt_ntp_server ? '(' + r.mgt_ntp_server + ')' : ''"></span>
+                        </td>
+                        <td style="padding:0.35rem 0.5rem;">
+                          <span :style="{color:r.mgt_ntp_check==='pass'?'#1a7a1a':'#c00',fontWeight:'600',fontSize:'0.82rem'}">
+                            <i :class="r.mgt_ntp_check==='pass'?'fas fa-check-circle':'fas fa-times-circle'" style="margin-right:0.3rem;"></i>
+                            <span x-text="r.mgt_ntp_check==='pass'?'Reachable (no ability to send a real NTP request)':'Not reachable'"></span>
+                          </span>
+                          <div x-show="r.mgt_ntp_detail" style="font-size:0.72rem;color:#6e777b;font-family:monospace;margin-top:0.2rem;white-space:pre-wrap;max-height:4.5rem;overflow-y:auto;" x-text="r.mgt_ntp_detail"></div>
                         </td>
                       </tr>
                       <tr style="border-bottom:1px solid #f0f0f0;">
@@ -3758,6 +3779,21 @@
                             <div x-show="r.wld_gw_ping_output" style="font-size:0.72rem;color:#6e777b;font-family:monospace;margin-top:0.2rem;white-space:pre-wrap;max-height:4.5rem;overflow-y:auto;" x-text="r.wld_gw_ping_output"></div>
                           </td>
                         </tr>
+                        <!-- NTP check row (workload) -->
+                        <tr x-show="r.wld_ntp_check != null && r.wld_ntp_check !== 'skip'" style="border-bottom:1px solid #f0f0f0;">
+                          <td style="padding:0.4rem 0.7rem 0.4rem 0; white-space:nowrap; color:#2d3748; font-weight:600;">
+                            <i class="fas fa-clock" style="color:#6e777b; margin-right:0.4rem; font-size:0.78rem;"></i>
+                            NTP reachability
+                            <span style="font-weight:400; color:#6e777b;" x-text="r.wld_ntp_server ? '(' + r.wld_ntp_server + ')' : ''"></span>
+                          </td>
+                          <td style="padding:0.35rem 0.5rem;">
+                              <span :style="{color:r.wld_ntp_check==='pass'?'#1a7a1a':'#c00',fontWeight:'600',fontSize:'0.82rem'}">
+                              <i :class="r.wld_ntp_check==='pass'?'fas fa-check-circle':'fas fa-times-circle'" style="margin-right:0.3rem;"></i>
+                              <span x-text="r.wld_ntp_check==='pass'?'Reachable (no ability to send a real NTP request)':'Not reachable'"></span>
+                            </span>
+                            <div x-show="r.wld_ntp_detail" style="font-size:0.72rem;color:#6e777b;font-family:monospace;margin-top:0.2rem;white-space:pre-wrap;max-height:4.5rem;overflow-y:auto;" x-text="r.wld_ntp_detail"></div>
+                          </td>
+                        </tr>
                         <tr style="border-bottom:1px solid #f0f0f0;">
                           <td style="padding:0.4rem 0.7rem 0.4rem 0; white-space:nowrap; color:#2d3748; font-weight:600;">
                             <i class="fas fa-server" style="color:#6e777b; margin-right:0.4rem; font-size:0.78rem;"></i>
@@ -3797,12 +3833,12 @@
                                 fontSize:'0.83rem',color:allPass?'#1a7a1a':'#c00',fontWeight:'600'}">
                     <i :class="allPass?'fas fa-check-circle':'fas fa-exclamation-circle'" style="margin-right:0.35rem;"></i>
                     <span x-text="allPass
-                      ? 'All checks passed - Supervisor VMs will have DNS connectivity.'
+                      ? 'All checks passed — Supervisor VMs will have network, NTP, and DNS connectivity.'
                       : (mgtOk && r.wld_error)
-                        ? 'Management DNS OK — Workload DNS check could not run: ' + r.wld_error
+                        ? 'Management OK — Workload check could not run: ' + r.wld_error
                         : mgtOk
-                          ? 'Management DNS OK — Workload DNS check failed. Verify DVLAN and Workload DNS settings.'
-                          : 'Management DNS check failed — verify Port Group, gateway, and DNS settings.'">
+                          ? 'Management OK — Workload check failed. Verify DVLAN, NTP, and Workload DNS settings.'
+                          : 'Management check failed — verify Port Group, gateway, NTP, and DNS settings.'">
                     </span>
                   </div>
 
@@ -5968,6 +6004,7 @@
               dns_servers:              this.wizardConfig.dns_servers,
               dns_servers_workload:     this.wizardConfig.dns_servers_workload,
               dns_workload_test_host:   this.wizardConfig.dns_workload_test_host || 'github.com',
+              ntp_servers:              this.wizardConfig.ntp_servers || '',
               vpc_connectivity_profile_path: this.wizardConfig.vpc_connectivity_profile_path,
               nsx_project_path: this.wizardConfig.nsx_project_path,
               search_domain:   this.wizardConfig.search_domains,

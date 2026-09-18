@@ -5144,15 +5144,39 @@ def check_dns_connectivity():
         return jsonify({"success": False, "error": "No DNS server specified"})
     dns_ip = dns_list[0]
 
+    ntp_raw  = body.get("ntp_servers", "")
+    ntp_list = [s.strip() for s in re.split(r'[,\s]+', ntp_raw) if s.strip()]
+    ntp_ip   = ntp_list[0] if ntp_list else ""
+
+    def _ntp_check(run_fn, stack_name, ntp_server, timeout=12):
+        """Check NTP server reachability via ICMP from the custom TCP/IP stack.
+
+        Uses vmkping -S <stack> so the ping is routed through the dedicated
+        VLAN stack (same interface/routing as the gateway ping), not the
+        default management vmk.
+
+        Note: ESXi tools cannot send a real NTP protocol request from a custom
+        stack — nc and Python sockets always use the default management stack.
+        ICMP reachability from the correct VLAN is the best we can do here.
+
+        Returns ('pass'|'fail', raw_ping_output)
+        """
+        p_out, p_err = run_fn(
+            f"vmkping -S {stack_name} -c 3 -W 2 {ntp_server} 2>&1", timeout=12)
+        ping_ok = "0% packet loss" in p_out or "bytes from" in p_out
+        return ("pass" if ping_ok else "fail"), (p_out + p_err).strip()
+
     result = {
         "success": False, "error": "",
         "host": "", "vmk": "", "vlan_id": None, "ip_used": first_ip,
         "gw_ping": None, "dns_ping": None, "dns_resolve": None,
+        "mgt_ntp_check": None, "mgt_ntp_server": ntp_ip, "mgt_ntp_detail": "",
         "gw_ping_output": "", "dns_ping_output": "", "dns_resolve_output": "",
         "dns_domain": "",
-        # Workload DNS test results
+        # Workload network test results
         "wld_vmk": "", "wld_vlan_id": None, "wld_ip_used": "", "wld_gateway": "",
         "wld_gw_ping": None, "wld_dns_ping": None, "wld_dns_resolve": None,
+        "wld_ntp_check": None, "wld_ntp_server": ntp_ip, "wld_ntp_detail": "",
         "wld_gw_ping_output": "", "wld_dns_ping_output": "", "wld_dns_resolve_output": "",
         "wld_dns_domain": "", "wld_error": "",
     }
@@ -5275,6 +5299,14 @@ def check_dns_connectivity():
             gw_pass = "0% packet loss" in gw_out or "bytes from" in gw_out
             result["gw_ping"]        = "pass" if gw_pass else "fail"
             result["gw_ping_output"] = (gw_out + gw_err).strip()
+
+            # 1b. NTP check — vmkping via stack + nc UDP/123
+            if ntp_ip:
+                result["mgt_ntp_check"], result["mgt_ntp_detail"] = \
+                    _ntp_check(_run, mgt_stack, ntp_ip)
+            else:
+                result["mgt_ntp_check"] = "skip"
+                result["mgt_ntp_detail"] = ""
 
             # 2. DNS server ping — uses the stack's default route, so it reaches
             #    the DNS server even when it's cross-subnet (no /32 hack needed).
@@ -5547,6 +5579,14 @@ def check_dns_connectivity():
                                                      "bytes from" in _wgw_o)
                                         result["wld_gw_ping"]        = "pass" if _wgw_pass else "fail"
                                         result["wld_gw_ping_output"] = (_wgw_o + _wgw_e).strip()
+
+                                        # a2. NTP check — vmkping via stack + nc UDP/123
+                                        if ntp_ip:
+                                            result["wld_ntp_check"], result["wld_ntp_detail"] = \
+                                                _ntp_check(_wrun, wld_stack, ntp_ip)
+                                        else:
+                                            result["wld_ntp_check"] = "skip"
+                                            result["wld_ntp_detail"] = ""
 
                                         # b. Ping workload DNS server
                                         #    Default route on stack routes via workload GW
