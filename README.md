@@ -84,8 +84,8 @@ The tool displays three side-by-side columns — one per deployment mode — eac
 
 ```bash
 # Clone the repo
-git clone https://github.com/ddesmidt/Supervisor_Intall_Tool.git
-cd Supervisor_Intall_Tool
+git clone https://github.com/ddesmidt/Supervisor_Install_Tool.git
+cd Supervisor_Install_Tool
 
 # Install Python dependencies
 apt-get install -y python3-flask python3-requests python3-paramiko
