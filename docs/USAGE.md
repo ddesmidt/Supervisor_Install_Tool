@@ -222,23 +222,25 @@ Two sections:
 | Search Domain(s) | Auto-populated from VNA/Edge node |
 | NTP Servers | Auto-populated from VNA/Edge node |
 
-### Optional: Check DNS Connectivity
+### Optional: Check Network Connectivity
 
-Once the management network fields are filled in, a **"Check DNS Connectivity"** button appears. It runs two independent test sets from a real ESX host using a temporary VMkernel adapter:
+Once the management network fields are filled in, a **"Check Network Connectivity"** button appears. It runs two independent test sets from a real ESX host using a temporary VMkernel adapter:
 
 | Test set | VLAN | What is verified |
 |---|---|---|
-| **Management DNS** | Management port group VLAN | vmkping gateway · vmkping DNS server · nslookup vCenter FQDN |
-| **Workload DNS** | Workload Ext. Conn. DVLAN | vmkping gateway · vmkping DNS server · nslookup `github.com` |
+| **Test Network — Management** | Management port group VLAN | vmkping gateway · vmkping NTP server · vmkping DNS server · nslookup vCenter FQDN |
+| **Test Network — Workload** | Workload Ext. Conn. DVLAN | vmkping gateway · vmkping NTP server · vmkping DNS server · nslookup `github.com` |
+
+> **Note on NTP:** ESXi cannot send a real NTP protocol request from a custom TCP/IP stack — the check uses ICMP ping to verify the NTP server is reachable from the correct VLAN, which is the best available test.
 
 **How it works:**
 1. Select an ESX host from the dropdown and enter its root password
 2. The tool temporarily enables SSH on the host (if not already enabled)
-3. **Management test** — creates a custom TCP/IP stack + temp VMkernel in the management VLAN, assigns the first control-plane IP, adds a default route, then runs vmkping + nslookup
-4. **Workload test** — creates a temp VMkernel in the workload DVLAN using the first available External IP Block address, runs vmkping + nslookup for `github.com`
+3. **Management test** — creates a custom TCP/IP stack + temp VMkernel in the management VLAN, assigns the first control-plane IP, adds a default route, then runs vmkping (gateway, NTP, DNS) + nslookup
+4. **Workload test** — creates a temp VMkernel in the workload DVLAN using the first available External IP Block address, runs vmkping (gateway, NTP, DNS) + nslookup for `github.com`
 5. Both VMkernels are always removed in a `finally` block; SSH is restored to its original state
 
-The button turns **green** when all 6 sub-tests pass (3 Management + 3 Workload), **red** if any fail. The modal info banner shows the exact VLANs and IPs that will be used before you run the test.
+The button turns **green** when all tests pass (gateway + NTP + DNS for each set), **red** if any fail. On success the banner reads: *"All checks passed — Supervisor VMs will have network, NTP, and DNS connectivity."*
 
 ### Wizard Step 3 — Storage
 
