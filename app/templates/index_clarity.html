@@ -485,11 +485,13 @@
                   <span x-html="installResult.error ? 'Authentication Failed' :
                         !installResult.installed
                           ? 'Supervisor is <span style=&quot;color:#c92100;&quot;>NOT</span> Installed'
-                          : 'Supervisor ' + (installResult.clusters[0]
-                              ? (installResult.clusters[0].supervisor || installResult.clusters[0].cluster_name || installResult.clusters[0].cluster || '')
-                              : '') + ' is ' + (installResult.clusters[0] && installResult.clusters[0].config_status === 'RUNNING'
-                              ? 'INSTALLED'
-                              : (installResult.clusters[0] && installResult.clusters[0].config_status || 'PRESENT'))"></span>
+                          : (installResult.clusters.length > 1
+                      ? installResult.clusters.length + ' Supervisors INSTALLED'
+                      : 'Supervisor ' + (installResult.clusters[0]
+                          ? (installResult.clusters[0].name || installResult.clusters[0].supervisor || installResult.clusters[0].cluster_name || installResult.clusters[0].cluster || '')
+                          : '') + ' is ' + (installResult.clusters[0] && installResult.clusters[0].config_status === 'RUNNING'
+                          ? 'INSTALLED'
+                          : (installResult.clusters[0] && installResult.clusters[0].config_status || 'PRESENT')))"></span>
                 </div>
                 <div class="card-block">
                   <!-- Error -->
@@ -507,7 +509,7 @@
                       <template x-for="c in installResult.clusters" :key="c.cluster || c.supervisor">
                         <div style="background:#f3f6fa; border:1px solid #dfe3e6; border-radius:3px; padding:0.75rem; margin-bottom:0.5rem;">
                           <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.25rem;">
-                            <span style="font-weight:600; color:#2b2b2b;" x-text="c.cluster || c.supervisor"></span>
+                            <span style="font-weight:600; color:#2b2b2b;" x-text="c.name || c.supervisor || c.cluster_name || c.cluster"></span>
                             <span class="status-chip"
                                   :class="c.config_status === 'RUNNING' ? 'running' :
                                           c.config_status === 'CONFIGURING' ? 'configuring' : 'error'"
@@ -611,10 +613,20 @@
                 </div>
                 <!-- Supervisor VIP summary — shown once data is loaded -->
                 <template x-if="vks.done && vks.supervisor_vip">
-                  <p style="font-size:0.72rem; color:#6e777b; margin:0 0 0.5rem 0;">
-                    <i class="fas fa-circle-nodes" style="margin-right:0.3rem; color:#0072a3;"></i>
-                    <span x-text="'Supervisor VIP: ' + vks.supervisor_vip + ' — ' + vks.clusters.length + ' cluster(s) across ' + vks.namespaces.length + ' namespace(s)'"></span>
-                  </p>
+                  <div style="font-size:0.72rem; color:#6e777b; margin:0 0 0.5rem 0;">
+                    <template x-if="(vks.supervisor_vips||[]).length > 1">
+                      <span>
+                        <i class="fas fa-circle-nodes" style="margin-right:0.3rem; color:#0072a3;"></i>
+                        <span x-text="(vks.supervisor_vips||[]).length + ' Supervisors · ' + vks.clusters.length + ' cluster(s) across ' + vks.namespaces.length + ' namespace(s)'"></span>
+                      </span>
+                    </template>
+                    <template x-if="!(vks.supervisor_vips||[]).length > 1">
+                      <span>
+                        <i class="fas fa-circle-nodes" style="margin-right:0.3rem; color:#0072a3;"></i>
+                        <span x-text="'Supervisor VIP: ' + vks.supervisor_vip + ' — ' + vks.clusters.length + ' cluster(s) across ' + vks.namespaces.length + ' namespace(s)'"></span>
+                      </span>
+                    </template>
+                  </div>
                 </template>
 
                 <!-- Error -->
@@ -638,6 +650,7 @@
                     <table style="width:100%; border-collapse:collapse; font-size:0.78rem;">
                       <thead>
                         <tr style="background:#f3f6fa; border-bottom:1px solid #dfe3e6;">
+                          <th x-show="(vks.supervisor_vips||[]).length > 1" style="padding:0.35rem 0.6rem; text-align:left; font-weight:600; color:#4a5568; white-space:nowrap;">Supervisor VIP</th>
                           <th style="padding:0.35rem 0.6rem; text-align:left; font-weight:600; color:#4a5568; white-space:nowrap;">Namespace</th>
                           <th style="padding:0.35rem 0.6rem; text-align:left; font-weight:600; color:#4a5568; white-space:nowrap;">Cluster Name</th>
                           <th style="padding:0.35rem 0.6rem; text-align:left; font-weight:600; color:#4a5568; white-space:nowrap;">Phase</th>
@@ -649,9 +662,12 @@
                         </tr>
                       </thead>
                       <tbody>
-                        <template x-for="(c, i) in vks.clusters" :key="c.namespace + '/' + c.name">
+                        <template x-for="(c, i) in vks.clusters" :key="(c.supervisor_vip||'') + '/' + c.namespace + '/' + c.name">
                           <tr :style="i % 2 === 0 ? '' : 'background:#f9fafb;'"
                               style="border-bottom:1px solid #eef0f2;">
+                            <td x-show="(vks.supervisor_vips||[]).length > 1"
+                                style="padding:0.35rem 0.6rem; font-family:monospace; font-size:0.73rem; color:#0072a3;"
+                                x-text="c.supervisor_vip || '—'"></td>
                             <td style="padding:0.35rem 0.6rem; font-family:monospace; font-size:0.73rem;" x-text="c.namespace"></td>
                             <td style="padding:0.35rem 0.6rem; font-weight:600;" x-text="c.name"></td>
                             <td style="padding:0.35rem 0.6rem;">
@@ -1120,8 +1136,8 @@
                             </div>
                           </template>
 
-                          <!-- "Open in vCenter" — S5-4 Dist + Cent (VPC Connectivity Profile) -->
-                          <template x-if="check.step === '5-4' && col.key !== 'vds_flb'">
+                          <!-- S5-4 VPC Conn. Prof. — "Open in vCenter" when red OR green+default project -->
+                          <template x-if="check.step === '5-4' && col.key !== 'vds_flb' && !check.vcp_nsx_proj">
                             <div style="margin-top:0.55rem;">
                               <button class="btn btn-sm btn-link"
                                       style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;"
@@ -1138,6 +1154,24 @@
                                       ">
                                 <i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(VPC Conn. Prof.)</span>
                               </button>
+                            </div>
+                          </template>
+
+                          <!-- S5-4 VPC Conn. Prof. — "Open in NSX" when green + non-default project -->
+                          <template x-if="check.step === '5-4' && col.key !== 'vds_flb' && check.vcp_nsx_proj">
+                            <div style="margin-top:0.55rem; display:flex; flex-direction:column; gap:0.2rem;">
+                              <button class="btn btn-sm btn-link"
+                                      style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;"
+                                      @click.stop="
+                                        const _h = form.nsx_url.replace(/^https?:\/\//,'').replace(/\/+$/,'');
+                                        window.open('https://' + _h + '/nsx/#/app/vpc/home/vpcprofiles/connectivity', '_blank');
+                                      ">
+                                <i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in NSX <span style="font-weight:normal; opacity:0.75;">(VPC Conn. Prof.)</span>
+                              </button>
+                              <span style="font-size:0.68rem; color:#735a00; background:#fff8e1; border:1px solid #ffe082; border-radius:3px; padding:0.15rem 0.4rem; display:inline-flex; align-items:center; gap:0.3rem; width:fit-content;">
+                                <i class="fas fa-triangle-exclamation" style="font-size:0.65rem;"></i>
+                                Switch to project <strong x-text="check.vcp_proj_hint"></strong> using the dropdown at the top‑left of NSX
+                              </span>
                             </div>
                           </template>
 
@@ -1355,7 +1389,7 @@
                              class="step-details"
                              :style="{ background: check.status==='ok' ? '#f3fbf0' : check.status==='warning' ? '#fdf7f0' : check.status==='error' ? '#fdf0f0' : '#f3f6fa', 'border-top-color': check.status==='ok' ? '#c6e8ae' : check.status==='warning' ? '#f5d898' : check.status==='error' ? '#f5c2c2' : '#dfe3e6' }">
                           <pre style="white-space:pre-wrap; overflow-x:auto; font-size:0.72rem; color:#4a5568; margin:0;" x-text="check.details"></pre>
-                          <template x-if="check.step === '2'"><div style="margin-top:0.55rem; display:flex; flex-direction:column; gap:0.3rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-cluster-page-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,page:'drs'})}).then(r=>r.json()).then(d=>{let us=d.urls||[];if(!us.length){window.open(d.fallback||('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/'),'_blank');return;}us.forEach((u,i)=>setTimeout(()=>window.open(u.url,'_blank'),i*150));}).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(DRS)</span></button><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-cluster-page-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,page:'ha'})}).then(r=>r.json()).then(d=>{let us=d.urls||[];if(!us.length){window.open(d.fallback||('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/'),'_blank');return;}us.forEach((u,i)=>setTimeout(()=>window.open(u.url,'_blank'),i*150));}).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(HA)</span></button></div></template><template x-if="check.step === '3' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3;" @click.stop="fetch('/api/vc-network-config-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password})}).then(r=>r.json()).then(d=>{let us=d.urls||[];if(!us.length){window.open(d.fallback||('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/'),'_blank');return;}us.forEach((u,i)=>setTimeout(()=>window.open(u.url,'_blank'),i*150));}).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(NSX Host Prep)</span></button></div></template><template x-if="check.step === '4' && col.key === 'distributed'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3;" @click.stop="fetch('/api/vc-vcenter-folder-plugin-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,nav_key:'plugin.network.connectivity.vna.clusters'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(VNA Cluster)</span></button></div></template><template x-if="check.step === '4' && col.key === 'centralized'"><div style="margin-top:0.55rem; display:flex; flex-direction:column; gap:0.3rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vcenter-folder-plugin-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,nav_key:'plugin.network.connectivity.edge.clusters'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Edge Cluster)</span></button><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="let h=form.nsx_url.replace(/^https?:\/\//,'').replace(/\/+$/,''); window.open('https://'+h+'/nsx/#/app/networks/providers/home/providers','_blank')"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in NSX <span style="opacity:0.7;">(Tier-0)</span></button></div></template><template x-if="check.step === '5-1' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vcenter-folder-plugin-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,plugin:'vpc',nav_key:'plugin.vc.external.connection'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Ext. Conn.)</span></button></div></template><template x-if="check.step === '5-2' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-tgw-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,tgw_name:check.tgw_name||''})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Trans. GW)</span></button></div></template><template x-if="check.step === '5-3' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vpc-ipblocks-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Ext. IP Block)</span></button></div></template><template x-if="check.step === '5-4' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vpc-ipblocks-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,nav_key:'plugin.vpc.aggregated.connectivity.profile'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(VPC Conn. Prof.)</span></button></div></template>
+                          <template x-if="check.step === '2'"><div style="margin-top:0.55rem; display:flex; flex-direction:column; gap:0.3rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-cluster-page-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,page:'drs'})}).then(r=>r.json()).then(d=>{let us=d.urls||[];if(!us.length){window.open(d.fallback||('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/'),'_blank');return;}us.forEach((u,i)=>setTimeout(()=>window.open(u.url,'_blank'),i*150));}).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(DRS)</span></button><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-cluster-page-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,page:'ha'})}).then(r=>r.json()).then(d=>{let us=d.urls||[];if(!us.length){window.open(d.fallback||('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/'),'_blank');return;}us.forEach((u,i)=>setTimeout(()=>window.open(u.url,'_blank'),i*150));}).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(HA)</span></button></div></template><template x-if="check.step === '3' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3;" @click.stop="fetch('/api/vc-network-config-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password})}).then(r=>r.json()).then(d=>{let us=d.urls||[];if(!us.length){window.open(d.fallback||('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/'),'_blank');return;}us.forEach((u,i)=>setTimeout(()=>window.open(u.url,'_blank'),i*150));}).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(NSX Host Prep)</span></button></div></template><template x-if="check.step === '4' && col.key === 'distributed'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3;" @click.stop="fetch('/api/vc-vcenter-folder-plugin-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,nav_key:'plugin.network.connectivity.vna.clusters'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(VNA Cluster)</span></button></div></template><template x-if="check.step === '4' && col.key === 'centralized'"><div style="margin-top:0.55rem; display:flex; flex-direction:column; gap:0.3rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vcenter-folder-plugin-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,nav_key:'plugin.network.connectivity.edge.clusters'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Edge Cluster)</span></button><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="let h=form.nsx_url.replace(/^https?:\/\//,'').replace(/\/+$/,''); window.open('https://'+h+'/nsx/#/app/networks/providers/home/providers','_blank')"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in NSX <span style="opacity:0.7;">(Tier-0)</span></button></div></template><template x-if="check.step === '5-1' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vcenter-folder-plugin-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,plugin:'vpc',nav_key:'plugin.vc.external.connection'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Ext. Conn.)</span></button></div></template><template x-if="check.step === '5-2' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-tgw-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,tgw_name:check.tgw_name||''})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Trans. GW)</span></button></div></template><template x-if="check.step === '5-3' && col.key !== 'vds_flb'"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vpc-ipblocks-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(Ext. IP Block)</span></button></div></template><template x-if="check.step === '5-4' && col.key !== 'vds_flb' && !check.vcp_nsx_proj"><div style="margin-top:0.55rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="fetch('/api/vc-vpc-ipblocks-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vc_url:form.vc_url,username:form.username,password:form.password,nav_key:'plugin.vpc.aggregated.connectivity.profile'})}).then(r=>r.json()).then(d=>window.open(d.url||d.fallback,'_blank')).catch(()=>window.open('https://'+form.vc_url.replace(/^https?:\/\//,'').replace(/\/+$/,'')+'/ui/','_blank'))"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in vCenter <span style="font-weight:normal; opacity:0.75;">(VPC Conn. Prof.)</span></button></div></template><template x-if="check.step === '5-4' && col.key !== 'vds_flb' && check.vcp_nsx_proj"><div style="margin-top:0.55rem; display:flex; flex-direction:column; gap:0.2rem;"><button class="btn btn-sm btn-link" style="font-size:0.72rem; padding:0.15rem 0.45rem; color:#0072a3; text-align:left;" @click.stop="const _h=form.nsx_url.replace(/^https?:\/\//,'').replace(/\/+$/,''); window.open('https://'+_h+'/nsx/#/app/vpc/home/vpcprofiles/connectivity','_blank')"><i class="fas fa-external-link-alt" style="margin-right:0.3rem;"></i>Open in NSX <span style="font-weight:normal; opacity:0.75;">(VPC Conn. Prof.)</span></button><span style="font-size:0.68rem; color:#735a00; background:#fff8e1; border:1px solid #ffe082; border-radius:3px; padding:0.15rem 0.4rem; display:inline-flex; align-items:center; gap:0.3rem; width:fit-content;"><i class="fas fa-triangle-exclamation" style="font-size:0.65rem;"></i> Switch to project <strong x-text="check.vcp_proj_hint"></strong> using the dropdown at top‑left of NSX</span></div></template>
                         </div>
                       </div>
                     </template>
@@ -1413,10 +1447,10 @@
                 <span>Discovering environment options…</span>
               </div>
 
-              <!-- Step 1: Cluster -->
+              <!-- Step 1: Zone / Cluster -->
               <div x-show="wizardStep === 1" style="padding:1.1rem;">
                 <p style="font-size:0.85rem; font-weight:500; color:#2b2b2b; margin-bottom:0.9rem;">
-                  Select the compute cluster for the Supervisor control plane:
+                  Select the vSphere Zone for the Supervisor control plane.
                 </p>
                 <template x-if="wizardOptions && wizardOptions.error">
                   <div class="alert alert-danger alert-sm" style="margin-bottom:0.75rem;">
@@ -1425,29 +1459,82 @@
                     </div></div>
                   </div>
                 </template>
-                <div>
-                  <template x-for="c in (wizardOptions ? wizardOptions.clusters : [])" :key="c.cluster">
-                    <div @click="wizardConfig.cluster_moref = c.cluster; wizardConfig.cluster_name = c.name"
-                         class="sel-row"
-                         :class="wizardConfig.cluster_moref === c.cluster ? 'selected' : ''">
-                      <div class="radio-dot"
-                           :class="wizardConfig.cluster_moref === c.cluster ? 'selected' : ''"></div>
-                      <i class="fas fa-server" style="color:#6e777b; font-size:0.82rem; flex-shrink:0;"></i>
-                      <div style="flex:1; min-width:0;">
-                        <span style="font-weight:600; font-size:0.85rem; color:#2b2b2b;" x-text="c.name"></span>
-                        <span style="margin-left:0.5rem; font-size:0.68rem; color:#6e777b; font-family:monospace;" x-text="c.cluster"></span>
+
+                <!-- ── Zone-based selector (vCenter 8.x / VCF 5.x) ── -->
+                <template x-if="wizardOptions && wizardOptions.zones && wizardOptions.zones.length > 0">
+                  <div>
+                    <template x-for="z in wizardOptions.zones" :key="z.zone">
+                      <div @click="wizardConfig.zone_id = z.zone;
+                                   wizardConfig.cluster_moref = (z.clusters && z.clusters[0]) ? z.clusters[0].cluster : z.zone;
+                                   wizardConfig.cluster_name  = z.name"
+                           class="sel-row"
+                           :class="wizardConfig.zone_id === z.zone ? 'selected' : ''"
+                           style="flex-direction:column; align-items:flex-start; gap:0.4rem; padding:0.6rem 0.75rem;">
+                        <!-- Zone header row -->
+                        <div style="display:flex; align-items:center; gap:0.5rem; width:100%;">
+                          <div class="radio-dot" :class="wizardConfig.zone_id === z.zone ? 'selected' : ''"></div>
+                          <i class="fas fa-layer-group" style="color:#0072a3; font-size:0.82rem; flex-shrink:0;"></i>
+                          <span style="font-weight:600; font-size:0.85rem; color:#2b2b2b; flex:1;" x-text="z.name"></span>
+                          <span style="font-size:0.68rem; color:#6e777b; font-family:monospace;" x-text="z.zone"></span>
+                        </div>
+                        <!-- Clusters within the zone -->
+                        <template x-if="z.clusters && z.clusters.length > 0">
+                          <div style="margin-left:1.9rem; display:flex; flex-direction:column; gap:0.25rem;">
+                            <template x-for="c in z.clusters" :key="c.cluster">
+                              <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.78rem; flex-wrap:wrap;">
+                                <i class="fas fa-server" style="color:#6e777b; font-size:0.72rem; flex-shrink:0;"></i>
+                                <span style="color:#2b2b2b; font-weight:500;" x-text="c.name"></span>
+                                <span style="color:#6e777b; font-family:monospace; font-size:0.68rem;" x-text="c.cluster"></span>
+                                <span :style="{ color: c.ha_enabled === false ? '#c21d00' : '#48960c' }" style="font-size:0.7rem; flex-shrink:0;">
+                                  <i :class="c.ha_enabled === false ? 'fas fa-times' : 'fas fa-check'"></i> HA
+                                </span>
+                                <span :style="{ color: c.drs_enabled === false ? '#e07400' : '#48960c' }" style="font-size:0.7rem; flex-shrink:0;">
+                                  <i :class="c.drs_enabled === false ? 'fas fa-exclamation' : 'fas fa-check'"></i> DRS
+                                </span>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
                       </div>
-                      <div style="display:flex; gap:0.65rem; font-size:0.72rem; flex-shrink:0;">
-                        <span :style="{ color: c.ha_enabled === false ? '#c21d00' : '#48960c' }">
-                          <i :class="c.ha_enabled === false ? 'fas fa-times' : 'fas fa-check'"></i> HA
-                        </span>
-                        <span :style="{ color: c.drs_enabled === false ? '#e07400' : '#48960c' }">
-                          <i :class="c.drs_enabled === false ? 'fas fa-exclamation' : 'fas fa-check'"></i> DRS
-                        </span>
+                    </template>
+                  </div>
+                </template>
+
+                <!-- ── Zones API debug notice ── -->
+                <template x-if="wizardOptions && wizardOptions.zones_debug">
+                  <p style="font-size:0.7rem; color:#735a00; background:#fff8e1; border:1px solid #ffe082; border-radius:3px; padding:0.3rem 0.5rem; margin-bottom:0.6rem;">
+                    <i class="fas fa-triangle-exclamation" style="margin-right:0.3rem;"></i>
+                    Zones API: <span x-text="wizardOptions.zones_debug"></span> — falling back to cluster list.
+                  </p>
+                </template>
+
+                <!-- ── Fallback: flat cluster list (older vCenter / no zones configured) ── -->
+                <template x-if="!(wizardOptions && wizardOptions.zones && wizardOptions.zones.length > 0)">
+                  <div>
+                    <template x-for="c in (wizardOptions ? wizardOptions.clusters : [])" :key="c.cluster">
+                      <div @click="wizardConfig.cluster_moref = c.cluster; wizardConfig.cluster_name = c.name; wizardConfig.zone_id = c.cluster"
+                           class="sel-row"
+                           :class="wizardConfig.cluster_moref === c.cluster ? 'selected' : ''">
+                        <div class="radio-dot"
+                             :class="wizardConfig.cluster_moref === c.cluster ? 'selected' : ''"></div>
+                        <i class="fas fa-server" style="color:#6e777b; font-size:0.82rem; flex-shrink:0;"></i>
+                        <div style="flex:1; min-width:0;">
+                          <span style="font-weight:600; font-size:0.85rem; color:#2b2b2b;" x-text="c.name"></span>
+                          <span style="margin-left:0.5rem; font-size:0.68rem; color:#6e777b; font-family:monospace;" x-text="c.cluster"></span>
+                        </div>
+                        <div style="display:flex; gap:0.65rem; font-size:0.72rem; flex-shrink:0;">
+                          <span :style="{ color: c.ha_enabled === false ? '#c21d00' : '#48960c' }">
+                            <i :class="c.ha_enabled === false ? 'fas fa-times' : 'fas fa-check'"></i> HA
+                          </span>
+                          <span :style="{ color: c.drs_enabled === false ? '#e07400' : '#48960c' }">
+                            <i :class="c.drs_enabled === false ? 'fas fa-exclamation' : 'fas fa-check'"></i> DRS
+                          </span>
+                        </div>
                       </div>
-                    </div>
-                  </template>
-                </div>
+                    </template>
+                  </div>
+                </template>
+
                 <p style="font-size:0.72rem; color:#6e777b; margin-top:0.7rem;">
                   <i class="fas fa-circle-info" style="color:#0072a3; margin-right:0.25rem;"></i>
                   HA and DRS are required. If disabled, they will be enabled automatically before deployment.
@@ -1686,7 +1773,8 @@
                     <tbody>
                       <template x-for="([k,v]) in [
                           ['Name', wizardConfig.name],
-                          ['Cluster', wizardConfig.cluster_name + ' (' + wizardConfig.cluster_moref + ')'],
+                          [(wizardOptions && wizardOptions.zones && wizardOptions.zones.length > 0) ? 'Zone' : 'Cluster',
+                            wizardConfig.cluster_name + ' (' + (wizardConfig.zone_id || wizardConfig.cluster_moref) + ')'],
                           ['Size', wizardConfig.size],
                           ['NSX Project', wizardConfig.nsx_project_name],
                           ['VPC Profile', wizardConfig.vpc_profile_name],
@@ -1832,7 +1920,7 @@
                 <button x-show="wizardStep >= 1 && wizardStep < 5"
                         @click="wizardAdvance()"
                         :disabled="
-                          (wizardStep===1 && !wizardConfig.cluster_moref) ||
+                          (wizardStep===1 && !wizardConfig.zone_id && !wizardConfig.cluster_moref) ||
                           (wizardStep===2 && (!wizardConfig.port_group_id || !wizardConfig.first_ip || !!firstIpError() || !wizardConfig.gateway_cidr || !wizardConfig.dns_servers || !wizardConfig.dns_servers_workload || !wizardConfig.nsx_project_path || !wizardConfig.vpc_connectivity_profile_path)) ||
                           (wizardStep===3 && !wizardConfig.storage_policy_uuid) ||
                           (wizardStep===4 && !wizardConfig.name)
@@ -4113,10 +4201,10 @@
       },
       vlanResult: null,   // null | 'pass' | 'fail'
 
-      vks: { loading: false, done: false, clusters: [], namespaces: [], supervisor_vip: '', error: null,
+      vks: { loading: false, done: false, clusters: [], namespaces: [], supervisor_vip: '', supervisor_vips: [], error: null,
              username: '', password: '', showPwd: false, clusterStatus: {},
              ct: { loading: false, done: false, error: null, groups: [], server_ip: '',
-                   supervisor_vip: '', cluster: '', show: false, topoSvg: '' } },
+                                     supervisor_vip: '', supervisor_vips: [], cluster: '', show: false, topoSvg: '' } },
 
       topo: { show: false, loading: false, error: null, svg: '', cluster: '' },
       topoNsx: null,   // cached raw NSX topology response for reuse in other panels
@@ -4132,7 +4220,7 @@
       wizardLoading: false,
       wizardOptions: null,
       wizardConfig: {
-        cluster_moref: '', cluster_name: '',
+        zone_id: '', cluster_moref: '', cluster_name: '',
         port_group_id: '',
         first_ip: '', gateway_cidr: '',
         dns_servers: '', dns_servers_workload: '', dns_workload_test_host: 'github.com', search_domains: '', ntp_servers: '',
@@ -4204,7 +4292,7 @@
         this.vks           = { loading: false, done: false, clusters: [], namespaces: [], supervisor_vip: '', error: null,
                                username: '', password: '', showPwd: false, clusterStatus: {},
                                ct: { loading: false, done: false, error: null, groups: [], server_ip: '',
-                                     supervisor_vip: '', cluster: '', show: false } };
+                                     supervisor_vip: '', supervisor_vips: [], cluster: '', show: false } };
         this.showInstallWizard = false;
         this.wizardStep    = 0;
         document.querySelectorAll('.req-cols .card-header, .req-cols .pros-cons-section')
@@ -4323,9 +4411,10 @@
           });
           const d = await r.json();
           if (d.success) {
-            this.vks.clusters       = d.clusters || [];
-            this.vks.namespaces     = d.namespaces || [];
-            this.vks.supervisor_vip = d.supervisor_vip || '';
+            this.vks.clusters        = d.clusters || [];
+            this.vks.namespaces      = d.namespaces || [];
+            this.vks.supervisor_vip  = d.supervisor_vip  || '';
+            this.vks.supervisor_vips = d.supervisor_vips || [d.supervisor_vip].filter(Boolean);
           } else {
             this.vks.error = d.error || 'Unknown error';
           }
@@ -4388,6 +4477,7 @@
             cluster_name:      cluster ? cluster.name      : '',
             cluster_namespace: cluster ? cluster.namespace : '',
             cluster_vip:       cluster ? (cluster.control_plane_vip || '') : '',
+            supervisor_vip:    cluster ? (cluster.supervisor_vip || '') : '',
             sup_vpc_nat: (_tgws.find(t => t.type === 'C') || {}).nat_ip || '',
             vks_vpc_nat: _vksNat,
           };
@@ -4876,7 +4966,7 @@
         this.deployStatus  = null;
         this.wizardDeployMode = deployMode || 'distributed';
         this.wizardConfig  = {
-          cluster_moref: '', cluster_name: '',
+          zone_id: '', cluster_moref: '', cluster_name: '',
           port_group_id: '', port_group_name: '',
           first_ip: '', gateway_cidr: '',
           dns_servers: '', dns_servers_workload: '', dns_workload_test_host: 'github.com', search_domains: '', ntp_servers: '',
@@ -4896,11 +4986,18 @@
           const d = await r.json();
           this.wizardOptions = d;
           if (!d.error) {
-            // Auto-select cluster if only one is available
+            // Auto-select zone (preferred) or cluster if only one is available
+            const zones    = d.zones    || [];
             const clusters = d.clusters || [];
-            if (clusters.length === 1) {
+            if (zones.length === 1) {
+              const z = zones[0];
+              this.wizardConfig.zone_id       = z.zone;
+              this.wizardConfig.cluster_name  = z.name;
+              this.wizardConfig.cluster_moref = (z.clusters && z.clusters[0]) ? z.clusters[0].cluster : z.zone;
+            } else if (zones.length === 0 && clusters.length === 1) {
               this.wizardConfig.cluster_moref = clusters[0].cluster;
               this.wizardConfig.cluster_name  = clusters[0].name;
+              this.wizardConfig.zone_id       = clusters[0].cluster;
             }
             const dMode = this.wizardDeployMode || 'distributed';
             const nodeD = (d.node_defaults || {})[dMode] || null;
@@ -5805,6 +5902,13 @@
           const pgName = pgs.find(p => p.network === this.wizardConfig.port_group_id)?.name
                          || this.wizardConfig.port_group_name
                          || this.wizardConfig.port_group_id;
+          // Collect all cluster morefs from the selected zone (best-effort, backend re-fetches anyway)
+          const zones = (this.wizardOptions && this.wizardOptions.zones) || [];
+          const selZone = zones.find(z => z.zone === this.wizardConfig.zone_id);
+          const clusterMorefs = selZone && selZone.clusters && selZone.clusters.length > 0
+            ? selZone.clusters.map(c => c.cluster)
+            : [this.wizardConfig.cluster_moref].filter(Boolean);
+
           const r = await fetch('/api/dns-check-hosts', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -5812,6 +5916,8 @@
               vc_url:          this.form.vc_url,
               vc_user:         this.form.username,
               vc_pass:         this.form.password,
+              zone_id:         this.wizardConfig.zone_id,
+              cluster_morefs:  clusterMorefs,
               cluster_moref:   this.wizardConfig.cluster_moref,
               port_group_name: pgName,
               port_group_id:   this.wizardConfig.port_group_id,
@@ -5821,7 +5927,8 @@
             })
           });
           const d = await r.json();
-          m.hosts = d.hosts || [];
+          m.hosts = (d.hosts || []).slice().sort((a, b) =>
+            (a.short || a.name).localeCompare(b.short || b.name));
           if (m.hosts.length > 0) m.selectedHost = m.hosts[0].name;
           if (d.mgt_vlan       != null) m.preview.mgt_vlan      = d.mgt_vlan;
           if (d.wld_vlan       != null) m.preview.wld_vlan      = d.wld_vlan;

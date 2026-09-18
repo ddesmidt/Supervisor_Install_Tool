@@ -165,6 +165,42 @@ def index():
     return render_template("index_clarity.html")
 
 
+@app.route("/api/debug-zones", methods=["POST"])
+def debug_zones():
+    """Probe multiple candidate vSphere Zones API paths and return raw results."""
+    body     = request.get_json(force=True)
+    vc_url   = normalize_url(body.get("vc_url", ""))
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    candidates = [
+        "/api/vcenter/consumption-domains/zones",
+        "/api/vcenter/namespace-management/infrastructure/zones",
+        "/api/vcenter/namespaces/infrastructure/zones",
+        "/rest/vcenter/consumption-domains/zones",
+    ]
+    results = {}
+    try:
+        token, _ = vc_auth(vc_url, username, password)
+        for path in candidates:
+            try:
+                resp = SESS.get(
+                    f"{vc_url}{path}",
+                    headers={"vmware-api-session-id": token,
+                             "Accept": "application/json"},
+                    verify=False, timeout=10,
+                )
+                results[path] = {
+                    "status": resp.status_code,
+                    "body":   resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text[:300],
+                }
+            except Exception as e:
+                results[path] = {"status": "error", "body": str(e)}
+    except Exception as e:
+        return jsonify({"auth_error": str(e), "results": {}})
+    return jsonify({"results": results})
+
+
 @app.route("/api/check-installed", methods=["POST"])
 def check_installed():
     body = request.get_json(force=True)
@@ -186,6 +222,13 @@ def check_installed():
         clusters = vc_get(vc_url, token, "/api/vcenter/namespace-management/clusters") or []
         capability = vc_get(vc_url, token, "/api/vcenter/namespace-management/capability") or {}
 
+        # Build moref → human-readable name map from the standard cluster endpoint
+        try:
+            _all_clusters = vc_get(vc_url, token, "/api/vcenter/cluster") or []
+            _name_map = {cl.get("cluster"): cl.get("name", "") for cl in _all_clusters}
+        except Exception:
+            _name_map = {}
+
         # Enrich each cluster with detail data (api_server_cluster_endpoint, etc.)
         # The list endpoint omits these fields; the individual GET includes them.
         enriched = []
@@ -199,6 +242,9 @@ def check_installed():
                         c = {**c, **detail}
                 except Exception:
                     pass
+                # Attach human-readable cluster name (e.g. "supervisor-wld-a")
+                if cid in _name_map and _name_map[cid]:
+                    c["name"] = _name_map[cid]
             enriched.append(c)
 
         # Determine human-readable network mode for each cluster.
@@ -414,23 +460,52 @@ def check_requirements():
             d["dvlan"] = []; d["gw_conn"] = []; d["extconn_error"] = str(e)
 
         try:
-            # Fetch ALL TGWs, then all their attachments
-            tgw_list_resp = nsx_get(nsx_url, nsx_user, nsx_pass,
-                "/policy/api/v1/orgs/default/projects/default/transit-gateways")
-            all_tgws = (tgw_list_resp or {}).get("results", [])
-            d["tgw"] = next((t for t in all_tgws if t.get("id") == "default"), None)
+            # Fetch TGWs + attachments from ALL projects (not just default).
+            # Project-local TGWs have paths like
+            # /orgs/default/projects/<proj>/transit-gateways/<id>
+            # and VCPs reference them by full path, so we store _tgw_path for matching.
+            _proj_ids_for_tgw = ["default"]
+            try:
+                _pr = nsx_get(nsx_url, nsx_user, nsx_pass,
+                              "/policy/api/v1/orgs/default/projects")
+                for _p in (_pr or {}).get("results", []):
+                    _pid2 = _p.get("id", "")
+                    if _pid2 and _pid2 not in _proj_ids_for_tgw:
+                        _proj_ids_for_tgw.append(_pid2)
+            except Exception:
+                pass
+
+            all_tgws_flat = []
             d["tgw_all_att"] = []
-            for _tgw in all_tgws:
-                _tid = _tgw.get("id", "")
-                _ta  = nsx_get(nsx_url, nsx_user, nsx_pass,
-                    f"/policy/api/v1/orgs/default/projects/default"
-                    f"/transit-gateways/{_tid}/attachments")
-                for _a in (_ta or {}).get("results", []):
-                    _a["_tgw_id"]   = _tid
-                    _a["_tgw_name"] = _tgw.get("display_name", _tid)
-                    d["tgw_all_att"].append(_a)
-            # Backward compat: tgw_att = Default TGW attachments only
-            d["tgw_att"] = [a for a in d["tgw_all_att"] if a.get("_tgw_id") == "default"]
+            for _proj_id in _proj_ids_for_tgw:
+                try:
+                    _tl = nsx_get(nsx_url, nsx_user, nsx_pass,
+                                  f"/policy/api/v1/orgs/default/projects/{_proj_id}/transit-gateways")
+                    for _tgw in (_tl or {}).get("results", []):
+                        all_tgws_flat.append(_tgw)
+                        _tid  = _tgw.get("id", "")
+                        _tpath = _tgw.get("path", "")
+                        _ta = nsx_get(nsx_url, nsx_user, nsx_pass,
+                                      f"/policy/api/v1/orgs/default/projects/{_proj_id}"
+                                      f"/transit-gateways/{_tid}/attachments")
+                        for _a in (_ta or {}).get("results", []):
+                            _a["_tgw_id"]   = _tid
+                            _a["_tgw_path"] = _tpath
+                            _a["_tgw_name"] = _tgw.get("display_name", _tid)
+                            _a["_tgw_proj"] = _proj_id
+                            d["tgw_all_att"].append(_a)
+                except Exception:
+                    pass
+
+            d["tgw"] = next((t for t in all_tgws_flat
+                             if t.get("id") == "default"
+                             and "/projects/default/" in t.get("path", "")), None)
+            # path → display_name map for all TGWs across all projects
+            d["_tgw_names"] = {t.get("path", ""): t.get("display_name", t.get("id", "?"))
+                               for t in all_tgws_flat}
+            # Backward compat: tgw_att = Default project TGW attachments only
+            d["tgw_att"] = [a for a in d["tgw_all_att"]
+                            if a.get("_tgw_proj") == "default" and a.get("_tgw_id") == "default"]
         except Exception as e:
             d["tgw_all_att"] = []; d["tgw_att"] = []; d["tgw"] = None; d["tgw_error"] = str(e)
 
@@ -959,6 +1034,15 @@ def check_requirements():
                 all_vcps      = d.get("all_vcps", [v for v in [d.get("vcp")] if v])
                 cluster_label = "VNA Cluster" if mode == "distributed" else "Edge Cluster"
 
+                def _tgw_attachments(tgw_path):
+                    """Return all attachments for a TGW identified by its full path."""
+                    tgw_id = tgw_path.rstrip("/").split("/")[-1]
+                    return [
+                        a for a in d.get("tgw_all_att", [])
+                        if (a.get("_tgw_path") == tgw_path   # exact full-path match
+                            or a.get("_tgw_id") == tgw_id)   # fallback: ID-only match
+                    ]
+
                 def _vcp_is_valid_dist(vcp):
                     """Return True if a VCP satisfies the Distributed requirements."""
                     sg  = (vcp.get("service_gateway") or {})
@@ -966,14 +1050,13 @@ def check_requirements():
                     tgw_path = vcp.get("transit_gateway_path", "")
                     if not tgw_path:
                         return False
-                    tgw_id = tgw_path.rstrip("/").split("/")[-1]
                     has_dist = any(
-                        a.get("_tgw_id") == tgw_id and
                         "/distributed-vlan-connections/" in (a.get("connection_path") or "")
-                        for a in d.get("tgw_all_att", [])
+                        for a in _tgw_attachments(tgw_path)
                     )
                     return (has_dist and
                             bool(vcp.get("external_ip_blocks")) and
+                            bool(vcp.get("private_tgw_ip_blocks")) and
                             bool(sg.get("edge_cluster_paths")) and
                             bool(sg.get("enable")) and
                             bool(nat.get("enable_default_snat")))
@@ -987,14 +1070,13 @@ def check_requirements():
                     tgw_path = vcp.get("transit_gateway_path", "")
                     if not tgw_path:
                         return False
-                    tgw_id = tgw_path.rstrip("/").split("/")[-1]
                     has_cent = any(
-                        a.get("_tgw_id") == tgw_id and
                         "/gateway-connections/" in (a.get("connection_path") or "")
-                        for a in d.get("tgw_all_att", [])
+                        for a in _tgw_attachments(tgw_path)
                     )
                     return (has_cent and
                             bool(vcp.get("external_ip_blocks")) and
+                            bool(vcp.get("private_tgw_ip_blocks")) and
                             bool(sg.get("edge_cluster_paths")) and
                             bool(sg.get("enable")) and
                             bool(nat.get("enable_default_snat")))
@@ -1025,20 +1107,33 @@ def check_requirements():
                         nat = (sg.get("nat_config") or {})
                         proj  = v.get("_proj_name", v.get("_proj_id", "?"))
                         name  = v.get("display_name", v.get("id", "?"))
-                        tgw   = v.get("transit_gateway_path", "?").rstrip("/").split("/")[-1]
-                        ext_b = ", ".join(_b_display(b)
-                                          for b in (v.get("external_ip_blocks") or []))
-                        clu   = ", ".join(p.rstrip("/").split("/")[-1]
-                                          for p in (sg.get("edge_cluster_paths") or []))
+                        _tgw_p = v.get("transit_gateway_path", "")
+                        tgw    = (d.get("_tgw_names", {}).get(_tgw_p)
+                                  or _tgw_p.rstrip("/").split("/")[-1]
+                                  or "?")
+                        ext_b  = ", ".join(_b_display(b)
+                                           for b in (v.get("external_ip_blocks") or []))
+                        priv_b = ", ".join(_b_display(b)
+                                           for b in (v.get("private_tgw_ip_blocks") or []))
+                        clu    = ", ".join(p.rstrip("/").split("/")[-1]
+                                           for p in (sg.get("edge_cluster_paths") or []))
                         lines.append(f"· {name}  (Project: {proj})")
                         lines.append(f"  TGW: {tgw}")
                         lines.append(f"  External IP Block: {ext_b}")
+                        lines.append(f"  Private TGW IP Block: {priv_b}")
                         lines.append(f"  {cluster_label}: {clu}")
                         lines.append(f"  N/S Services: enabled")
                         lines.append(f"  Outbound NAT: enabled")
-                    subtitle = (f"1 valid VPC Connectivity Profile: {valid_vcps[0].get('display_name', valid_vcps[0].get('id','?'))}"
-                                if len(valid_vcps) == 1
-                                else f"{len(valid_vcps)} valid VPC Connectivity Profile(s)")
+                    if len(valid_vcps) == 1:
+                        _v0      = valid_vcps[0]
+                        _vname   = _v0.get("display_name", _v0.get("id", "?"))
+                        _vprojid = _v0.get("_proj_id", "default")
+                        _vpname  = _v0.get("_proj_name", _vprojid)
+                        subtitle = (f"1 valid VPC Connectivity Profile: {_vname} (Project: {_vpname})"
+                                    if _vprojid != "default"
+                                    else f"1 valid VPC Connectivity Profile: {_vname}")
+                    else:
+                        subtitle = f"{len(valid_vcps)} valid VPC Connectivity Profile(s)"
                     # Build structured deploy data (grouped by project) for the Deploy wizard
                     from collections import OrderedDict as _OD
                     _proj_map: dict = _OD()
@@ -1059,14 +1154,20 @@ def check_requirements():
                          "valid_vpc_profiles": profs}
                         for (pid, pname, ppath), profs in _proj_map.items()
                     ]
+                    _first_nondefault = next(
+                        (p for p in _deploy_projects if p["id"] != "default"), None)
+                    _proj_hint = " | ".join(p["display_name"] for p in _deploy_projects)
                     add("5-4", title_7, "ok", subtitle, "\n".join(lines),
-                        valid_vcps_for_deploy=_deploy_projects)
+                        valid_vcps_for_deploy=_deploy_projects,
+                        vcp_nsx_proj=(_first_nondefault["id"] if _first_nondefault else None),
+                        vcp_proj_hint=_proj_hint)
                 else:
                     tgw_bullet = ("  · Transit Gateway: Distributed"
                                   if mode == "distributed"
                                   else "  · Transit Gateway: Centralized")
                     req_lines = [tgw_bullet,
                                  "  · External IP Block",
+                                 "  · Private - Transit Gateway IP Blocks",
                                  f"  · {cluster_label}",
                                  "  · N/S Services",
                                  "  · Outbound NAT"]
@@ -1120,7 +1221,70 @@ def discover_install_options():
     try:
         token, _ = vc_auth(vc_url, username, password)
 
-        result["clusters"] = vc_get(vc_url, token, "/api/vcenter/cluster") or []
+        _raw_clusters = vc_get(vc_url, token, "/api/vcenter/cluster") or []
+        result["clusters"] = _raw_clusters
+
+        # ── vSphere Zones ──────────────────────────────────────────────────
+        # Use the official zone-associations API (vCenter 8.x / VCF 5.x).
+        _cluster_map = {c.get("cluster"): c for c in _raw_clusters}  # moref → cluster obj
+
+        def _parse_zones_list(raw):
+            """Normalise raw zones API response to a plain list of dicts.
+            Handles: plain list, {"value":[...]}, {"items":[...]}"""
+            if isinstance(raw, list):
+                return raw
+            if isinstance(raw, dict):
+                return raw.get("items", raw.get("value", [])) or []
+            return []
+
+        _zones_out = []
+
+        try:
+            # ── Step 1: get zone list ────────────────────────────────────────
+            _zr  = vc_get(vc_url, token, "/api/vcenter/consumption-domains/zones")
+            _zl  = _parse_zones_list(_zr)
+
+            # ── Step 2: get zone-cluster associations ────────────────────────
+            # Official API: GET /api/vcenter/consumption-domains/zone-associations/cluster
+            # Returns: {"associations": [{"cluster": "domain-c9", "zone": "zone1",
+            #                             "state": "ASSOCIATED"}, ...]}
+            _zone_cluster_map = {}   # zone_id → [cluster_morefs]
+            try:
+                _ar = vc_get(vc_url, token,
+                             "/api/vcenter/consumption-domains/zone-associations/cluster")
+                _assocs = (_ar.get("associations", [])
+                           if isinstance(_ar, dict) else _ar or [])
+                for _a in _assocs:
+                    if _a.get("state", "ASSOCIATED") == "ASSOCIATED":
+                        _zid_a   = _a.get("zone", "")
+                        _cmr_a   = _a.get("cluster", "")
+                        if _zid_a and _cmr_a:
+                            _zone_cluster_map.setdefault(_zid_a, []).append(_cmr_a)
+            except Exception:
+                pass   # endpoint may 404 on older builds — clusters will be empty
+
+            # ── Step 3: build zone entries ───────────────────────────────────
+            for _z in _zl:
+                if not isinstance(_z, dict):
+                    continue
+                _zid   = _z.get("zone", "")
+                _zname = _z.get("name", _zid)
+                _zone_clusters = []
+                for _cmr in _zone_cluster_map.get(_zid, []):
+                    _cd = _cluster_map.get(_cmr, {})
+                    _zone_clusters.append({
+                        "cluster":     _cmr,
+                        "name":        _cd.get("name", _cmr),
+                        "ha_enabled":  _cd.get("ha_enabled"),
+                        "drs_enabled": _cd.get("drs_enabled"),
+                    })
+                _zones_out.append({"zone": _zid, "name": _zname, "clusters": _zone_clusters})
+
+            result["zones"] = _zones_out
+        except Exception as _ze:
+            result["zones"] = []
+            result["zones_debug"] = str(_ze)
+
         result["storage_policies"] = (
             vc_get(vc_url, token, "/api/vcenter/storage/policies") or []
         )
@@ -1527,9 +1691,13 @@ def install_supervisor():
         ntp          = _list(cfg.get("ntp_servers", ""))
         domains      = _list(cfg.get("search_domains", ""))
 
+        # zone_id is the proper vSphere Zone ID (vCenter 8.x / VCF 5.x).
+        # Fall back to cluster_moref for older environments without zones.
+        _zone_ref = cfg.get("zone_id") or cfg.get("cluster_moref", "")
+
         spec = {
             "name": cfg["name"],
-            "zones": [cfg["cluster_moref"]],
+            "zones": [_zone_ref],
             "control_plane": {
                 "size": cfg.get("size", "SMALL"),
                 "storage_policy": cfg["storage_policy_uuid"],
@@ -1637,10 +1805,10 @@ def vks_clusters():
         # ── 1. Authenticate to vCenter ─────────────────────────────────────
         token, _ = vc_auth(vc_url, username, password)
 
-        # ── 2. Find the supervisor control-plane VIP ────────────────────────
+        # ── 2. Collect ALL supervisor control-plane VIPs (one per cluster) ──
         sup_clusters = vc_get(vc_url, token,
                               "/api/vcenter/namespace-management/clusters") or []
-        supervisor_vip = None
+        supervisor_vips = []
         for c in sup_clusters:
             cid = c.get("cluster")
             if not cid:
@@ -1648,71 +1816,85 @@ def vks_clusters():
             detail = vc_get(vc_url, token,
                             f"/api/vcenter/namespace-management/clusters/{cid}") or {}
             ep = detail.get("api_server_cluster_endpoint", "")
-            if ep:
-                supervisor_vip = ep
-                break
+            if ep and ep not in supervisor_vips:
+                supervisor_vips.append(ep)
 
-        if not supervisor_vip:
+        if not supervisor_vips:
             raise RuntimeError(
                 "Could not determine the Supervisor control-plane VIP. "
                 "Make sure the Supervisor is fully installed (RUNNING).")
 
-        result["supervisor_vip"] = supervisor_vip
+        # For backward-compat keep single-VIP fields; also expose full list
+        result["supervisor_vip"]  = supervisor_vips[0]
+        result["supervisor_vips"] = supervisor_vips
 
-        # ── 3. Login to the supervisor to get a K8s bearer token ───────────
-        s = requests.Session()
-        s.verify = False
-        login_r = s.post(f"https://{supervisor_vip}/wcp/login",
-                         auth=(sup_user, sup_pass),
-                         timeout=15)
-        if login_r.status_code not in (200, 204):
-            raise RuntimeError(
-                f"Supervisor login failed (HTTP {login_r.status_code}). "
-                f"Credentials used: {sup_user}. "
-                "The Supervisor may use a different SSO domain than vCenter "
-                "(e.g. administrator@wld.sso). Enter the correct credentials above.")
-        k8s_token = login_r.json().get("session_id", "")
-        if not k8s_token:
-            raise RuntimeError("Supervisor login succeeded but returned no session_id.")
+        # ── 3 + 4. For each VIP: login → list CAPI clusters ────────────────
+        all_clusters   = []
+        login_errors   = []
+        for supervisor_vip in supervisor_vips:
+            try:
+                s = requests.Session()
+                s.verify = False
+                login_r = s.post(f"https://{supervisor_vip}/wcp/login",
+                                 auth=(sup_user, sup_pass),
+                                 timeout=15)
+                if login_r.status_code not in (200, 204):
+                    login_errors.append(
+                        f"Supervisor {supervisor_vip}: login failed "
+                        f"(HTTP {login_r.status_code}). "
+                        f"Credentials used: {sup_user}. "
+                        "The Supervisor may use a different SSO domain "
+                        "(e.g. administrator@wld.sso).")
+                    continue
+                k8s_token = login_r.json().get("session_id", "")
+                if not k8s_token:
+                    login_errors.append(
+                        f"Supervisor {supervisor_vip}: login succeeded "
+                        "but returned no session_id.")
+                    continue
 
-        k8s_headers = {"Authorization": f"Bearer {k8s_token}",
-                       "Accept": "application/json"}
+                k8s_headers = {"Authorization": f"Bearer {k8s_token}",
+                               "Accept": "application/json"}
 
-        # ── 4. List CAPI clusters (VKS clusters) ───────────────────────────
-        capi_r = s.get(f"https://{supervisor_vip}:6443"
-                       f"/apis/cluster.x-k8s.io/v1beta1/clusters",
-                       headers=k8s_headers, timeout=20)
-        capi_r.raise_for_status()
-        items = capi_r.json().get("items", [])
+                capi_r = s.get(f"https://{supervisor_vip}:6443"
+                               f"/apis/cluster.x-k8s.io/v1beta1/clusters",
+                               headers=k8s_headers, timeout=20)
+                capi_r.raise_for_status()
+                items = capi_r.json().get("items", [])
 
-        clusters_out = []
-        for item in items:
-            meta   = item.get("metadata", {})
-            spec   = item.get("spec", {})
-            status = item.get("status", {})
-            cp_ep  = spec.get("controlPlaneEndpoint", {})
-            # Kubernetes version: prefer topology, then spec.version
-            k8s_ver = (spec.get("topology", {}).get("version")
-                       or spec.get("version")
-                       or status.get("controlPlane", {}).get("version", ""))
-            # Worker nodes count
-            workers = (spec.get("topology", {}).get("workers", {})
-                           .get("machineDeployments", []))
-            worker_count = sum(
-                (md.get("replicas") or 0) for md in workers
-            ) if workers else status.get("replicas", 0)
-            clusters_out.append({
-                "name":               meta.get("name", ""),
-                "namespace":          meta.get("namespace", ""),
-                "phase":              status.get("phase", "Unknown"),
-                "control_plane_vip":  cp_ep.get("host", ""),
-                "kubernetes_version": k8s_ver,
-                "cp_ready":           status.get("controlPlaneReady", False),
-                "infra_ready":        status.get("infrastructureReady", False),
-                "worker_replicas":    worker_count,
-                "created":            meta.get("creationTimestamp", ""),
-            })
-        result["clusters"] = clusters_out
+                for item in items:
+                    meta   = item.get("metadata", {})
+                    spec   = item.get("spec", {})
+                    status = item.get("status", {})
+                    cp_ep  = spec.get("controlPlaneEndpoint", {})
+                    k8s_ver = (spec.get("topology", {}).get("version")
+                               or spec.get("version")
+                               or status.get("controlPlane", {}).get("version", ""))
+                    workers = (spec.get("topology", {}).get("workers", {})
+                                       .get("machineDeployments", []))
+                    worker_count = sum(
+                        (md.get("replicas") or 0) for md in workers
+                    ) if workers else status.get("replicas", 0)
+                    all_clusters.append({
+                        "name":               meta.get("name", ""),
+                        "namespace":          meta.get("namespace", ""),
+                        "phase":              status.get("phase", "Unknown"),
+                        "control_plane_vip":  cp_ep.get("host", ""),
+                        "kubernetes_version": k8s_ver,
+                        "cp_ready":           status.get("controlPlaneReady", False),
+                        "infra_ready":        status.get("infrastructureReady", False),
+                        "worker_replicas":    worker_count,
+                        "created":            meta.get("creationTimestamp", ""),
+                        "supervisor_vip":     supervisor_vip,   # which Supervisor
+                    })
+            except Exception as _vip_exc:
+                login_errors.append(
+                    f"Supervisor {supervisor_vip}: {_vip_exc}")
+
+        result["clusters"] = all_clusters
+        # Surface per-VIP errors only when nothing was fetched at all
+        if login_errors and not all_clusters:
+            raise RuntimeError(" | ".join(login_errors))
 
         # ── 5. Namespace list from vCenter for context ─────────────────────
         ns_list = vc_get(vc_url, token, "/api/vcenter/namespaces/instances") or []
@@ -2185,6 +2367,9 @@ def connectivity_test():
     target_ns   = body.get("cluster_namespace", "")
     target_name = body.get("cluster_name", "")
     target_vip  = body.get("cluster_vip", "")
+    # Caller may pass the exact Supervisor VIP for the cluster under test
+    # (avoids always picking the first Supervisor when there are multiple)
+    hint_supervisor_vip = (body.get("supervisor_vip") or "").strip()
 
     out = {"success": False, "supervisor_vip": None, "server_ip": None,
            "groups": [], "error": None}
@@ -2200,22 +2385,28 @@ def connectivity_test():
             out["server_ip"] = "this server"
         server_label = f"This server ({out['server_ip']})"
 
-        # ── Auth vCenter → Supervisor VIP ─────────────────────────────────
-        vc_token, _ = vc_auth(vc_url, username, password)
-        for c in (vc_get(vc_url, vc_token,
-                         "/api/vcenter/namespace-management/clusters") or []):
-            cid = c.get("cluster", "")
-            if not cid:
-                continue
-            d = vc_get(vc_url, vc_token,
-                       f"/api/vcenter/namespace-management/clusters/{cid}") or {}
-            ep = d.get("api_server_cluster_endpoint", "")
-            if ep:
-                out["supervisor_vip"] = ep
-                break
-        if not out["supervisor_vip"]:
-            raise RuntimeError("Could not determine Supervisor Control Plane VIP.")
-        supervisor_vip = out["supervisor_vip"]
+        # ── Resolve Supervisor VIP ────────────────────────────────────────
+        # Prefer the VIP passed by the caller (one per cluster in multi-supervisor
+        # environments).  Fall back to vCenter discovery for backwards compat.
+        if hint_supervisor_vip:
+            supervisor_vip = hint_supervisor_vip
+        else:
+            vc_token, _ = vc_auth(vc_url, username, password)
+            supervisor_vip = None
+            for c in (vc_get(vc_url, vc_token,
+                             "/api/vcenter/namespace-management/clusters") or []):
+                cid = c.get("cluster", "")
+                if not cid:
+                    continue
+                d = vc_get(vc_url, vc_token,
+                           f"/api/vcenter/namespace-management/clusters/{cid}") or {}
+                ep = d.get("api_server_cluster_endpoint", "")
+                if ep:
+                    supervisor_vip = ep
+                    break
+            if not supervisor_vip:
+                raise RuntimeError("Could not determine Supervisor Control Plane VIP.")
+        out["supervisor_vip"] = supervisor_vip
 
         # ── Supervisor K8s login ──────────────────────────────────────────
         _sess = requests.Session()
@@ -4824,7 +5015,7 @@ def dns_check_hosts():
     vc_url     = normalize_url(body.get("vc_url", ""))
     vc_user    = body.get("vc_user", "") or body.get("username", "")
     vc_pass    = body.get("vc_pass", "") or body.get("password", "")
-    cluster_id = body.get("cluster_moref", "")
+    zone_id    = (body.get("zone_id") or "").strip()
     pg_name    = (body.get("port_group_name") or "").strip()
     pg_moref   = (body.get("port_group_id")   or "").strip()   # e.g. "dvportgroup-24"
     nsx_raw    = (body.get("nsx_url") or "").strip()
@@ -4833,11 +5024,43 @@ def dns_check_hosts():
     nsx_pass   = body.get("nsx_pass", "")
     try:
         token, _ = vc_auth(vc_url, vc_user, vc_pass)
-        raw   = vc_get(vc_url, token, "/api/vcenter/host",
-                       params={"clusters": cluster_id}) or []
-        hosts = [{"name": h.get("name", ""),
-                  "short": (h.get("name", "")).split(".")[0]}
-                 for h in raw if h.get("name")]
+
+        # ── Resolve cluster IDs for the zone (always fresh from vCenter) ─────
+        # Priority: (1) use zone_id → fetch live zone-associations
+        #           (2) fall back to cluster_morefs list from frontend
+        #           (3) fall back to single cluster_moref
+        cluster_ids = []
+        if zone_id:
+            try:
+                _ar = vc_get(vc_url, token,
+                             "/api/vcenter/consumption-domains/zone-associations/cluster")
+                _assocs = (_ar.get("associations", [])
+                           if isinstance(_ar, dict) else _ar or [])
+                for _a in _assocs:
+                    if (_a.get("zone") == zone_id and
+                            _a.get("state", "ASSOCIATED") == "ASSOCIATED"):
+                        cluster_ids.append(_a.get("cluster", ""))
+                cluster_ids = [c for c in cluster_ids if c]
+            except Exception:
+                pass
+        if not cluster_ids:
+            cluster_ids = [c for c in (body.get("cluster_morefs") or []) if c]
+        if not cluster_ids:
+            single = (body.get("cluster_moref") or "").strip()
+            if single:
+                cluster_ids = [single]
+
+        # Collect hosts from ALL clusters in the zone (dedup by name)
+        seen_names = set()
+        hosts = []
+        for cluster_id in cluster_ids:
+            raw = vc_get(vc_url, token, "/api/vcenter/host",
+                         params={"clusters": cluster_id}) or []
+            for h in raw:
+                hname = h.get("name", "")
+                if hname and hname not in seen_names:
+                    seen_names.add(hname)
+                    hosts.append({"name": hname, "short": hname.split(".")[0]})
 
         # ── Preview: management portgroup VLAN ──────────────────────────────
         mgt_vlan = None
@@ -4880,7 +5103,9 @@ def dns_check_hosts():
                         "mgt_vlan": mgt_vlan,
                         "wld_vlan": wld_vlan,
                         "wld_preview_ip": wld_preview_ip,
-                        "wld_gateway": wld_gateway})
+                        "wld_gateway": wld_gateway,
+                        "_debug_zone_id": zone_id,
+                        "_debug_cluster_ids": cluster_ids})
     except Exception as e:
         return jsonify({"hosts": [], "error": str(e)})
 
