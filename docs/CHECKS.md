@@ -252,7 +252,8 @@ The check runs in three phases:
 **What it checks:** Is there at least one Transit Gateway (TGW) that has an attachment pointing to a Distributed VLAN Connection?
 
 **APIs:**
-- `GET /policy/api/v1/orgs/default/projects/default/transit-gateways`
+- `GET /policy/api/v1/orgs/default/projects` — lists all NSX projects
+- `GET /…/projects/{id}/transit-gateways` — queries TGWs in **each** project (not just Default)
 - `GET /…/transit-gateways/{id}/attachments`
 
 **Expanded detail shows:**
@@ -371,7 +372,9 @@ Fully reactive form:
 - If the profile exists with the same TGW → `PATCH` (update fields only, no TGW change — NSX restriction)
 - If the profile exists with a different TGW → creates a new profile with a different ID (NSX does not allow changing `transit_gateway_path` on an existing profile)
 
-**Open in vCenter:** An **"Open in vCenter (VPC Conn. Prof.)"** link button opens VPC > Configure > **Connectivity Profile** directly in the vSphere Client.
+**Open in vCenter / Open in NSX:** An **"Open in vCenter (VPC Conn. Prof.)"** link button opens VPC > Configure > **Connectivity Profile** directly in the vSphere Client — shown when the profile is in the Default NSX project.
+
+When the satisfying profile is in a **non-default NSX project**, the button changes to **"Open in NSX (VPC Conn. Prof.)"** and opens the NSX Manager UI directly at the VPC Connectivity Profiles page. A yellow hint badge also appears reminding you to switch to the correct project using the dropdown at the top-left of the NSX UI.
 
 ---
 
@@ -398,8 +401,8 @@ Key NSX Policy API paths used by this tool:
 | VNA Clusters | `/policy/api/v1/infra/sites/default/enforcement-points/default/virtual-network-appliance-clusters` |
 | Distributed VLAN Connections | `/policy/api/v1/infra/distributed-vlan-connections` |
 | Gateway Connections | `/policy/api/v1/infra/gateway-connections` |
-| Transit Gateways | `/policy/api/v1/orgs/default/projects/default/transit-gateways` |
-| TGW Attachments | `/policy/api/v1/orgs/default/projects/default/transit-gateways/{id}/attachments` |
+| Transit Gateways | `/policy/api/v1/orgs/default/projects/{id}/transit-gateways` (all projects) |
+| TGW Attachments | `/policy/api/v1/orgs/default/projects/{id}/transit-gateways/{id}/attachments` |
 | TGW Centralized Config | `/policy/api/v1/orgs/default/projects/default/transit-gateways/{id}/centralized-configs` |
 | IP Blocks | `/policy/api/v1/infra/ip-blocks` |
 | VPC Connectivity Profiles | `/policy/api/v1/orgs/default/projects/{id}/vpc-connectivity-profiles` |

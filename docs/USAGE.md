@@ -46,7 +46,8 @@ Click **"Check if Supervisor is Installed"**.
 
 **Possible results:**
 
-- **Supervisor [name] is INSTALLED** (green banner) — Supervisor is running on this vCenter. The cluster name, config status, k8s status, control plane VIP, and **network mode** (`NSX-VPC Distributed`, `NSX-VPC Centralized`, or `VDS / FLB`) are shown. The network mode is auto-detected by querying the NSX Transit Gateway attachment type via the NSX API.
+- **Supervisor [name] is INSTALLED** (green banner) — one Supervisor is running on this vCenter. The cluster name, config status, k8s status, control plane VIP, and **network mode** (`NSX-VPC Distributed`, `NSX-VPC Centralized`, or `VDS / FLB`) are shown. The network mode is auto-detected by querying the NSX Transit Gateway attachment type via the NSX API.
+- **N Supervisors INSTALLED** (green banner) — multiple Supervisors are running on this vCenter (e.g. in a multi-cluster or multi-zone setup). The count is shown; the VKS section will list clusters across all of them.
 - **Supervisor is NOT installed** (blue banner) — Supervisor is not yet deployed.
 
 > **Auto-run:** When NSX credentials are filled in, the requirements check runs automatically after a successful install check — so by the time the banner appears, the 3-column requirement matrix is already loading in the background.
@@ -105,7 +106,7 @@ Most steps show a small **"Open in vCenter"** link button below the step title. 
 | R5-1 | External Connections page |
 | R5-2 | Transit Gateway detail page (jumps to the specific TGW found by the check) |
 | R5-3 | VPC > Configure > IP Blocks |
-| R5-4 | VPC > Configure > Connectivity Profile |
+| R5-4 | VPC > Configure > Connectivity Profile — **or** "Open in NSX (VPC Conn. Prof.)" with a project-switch hint when the valid profile is in a non-default NSX project |
 
 ### Check MTU Button
 
@@ -191,8 +192,12 @@ Once all steps in a column are green, click **"Deploy Supervisor"** in that colu
 
 A 4-step wizard opens:
 
-### Wizard Step 1 — Cluster
-Select the vSphere cluster to enable Supervisor on. If only one cluster exists it is pre-selected.
+### Wizard Step 1 — vSphere Zone / Cluster
+
+Select the vSphere Zone (or compute cluster) to enable Supervisor on.
+
+- **vCenter 8.x / VCF 5.x and later**: a **Zone-based selector** is shown — choose the vSphere Zone that contains your target cluster. Zones are fetched from the vCenter Consumption Domains API.
+- **Single cluster / no Zones configured**: a **cluster selector** is shown — choose the cluster directly. If only one cluster exists it is pre-selected.
 
 ### Wizard Step 2 — Network
 | Field | Description |
@@ -266,6 +271,7 @@ A summary line shows the Supervisor VIP and the total number of clusters and nam
 
 | Column | Description |
 |---|---|
+| Supervisor VIP | *(shown only when multiple Supervisors are running)* — the Control Plane VIP of the Supervisor this cluster belongs to |
 | Cluster Name | CAPI cluster name and namespace |
 | Phase | Kubernetes cluster lifecycle phase (e.g. Provisioned, Deleting) |
 | Control Plane VIP | The VKS cluster's own Kubernetes API endpoint |
