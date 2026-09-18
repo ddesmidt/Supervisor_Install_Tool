@@ -196,8 +196,8 @@ A 4-step wizard opens:
 
 Select the vSphere Zone (or compute cluster) to enable Supervisor on.
 
-- **vCenter 8.x / VCF 5.x and later**: a **Zone-based selector** is shown — choose the vSphere Zone that contains your target cluster. Zones are fetched from the vCenter Consumption Domains API.
-- **Single cluster / no Zones configured**: a **cluster selector** is shown — choose the cluster directly. If only one cluster exists it is pre-selected.
+- **Zone(s) configured**: a **Zone-based selector** is shown — choose the vSphere Zone that contains your target cluster.
+- **No Zone configured**: a **cluster selector** is shown — choose the cluster directly. If only one cluster exists it is pre-selected.
 
 ### Wizard Step 2 — Network
 | Field | Description |
