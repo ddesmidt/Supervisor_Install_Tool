@@ -2082,12 +2082,12 @@
             </p>
           </div>
 
-          <!-- ③ Datastore -->
+          <!-- ③ Datastore — scoped to selected cluster when cluster_datastores available -->
           <div class="clr-form-control" style="margin-bottom:0.75rem;">
             <label class="clr-control-label" style="font-size:0.68rem;">Datastore</label>
             <div class="clr-control-container"><div class="clr-select-wrapper">
               <select x-model="vnaWizard.form.datastore_id" class="clr-select">
-                <template x-for="ds in (vnaWizard.options ? vnaWizard.options.datastores : [])" :key="ds.datastore">
+                <template x-for="ds in vnaCurrentDatastores()" :key="ds.datastore">
                   <option :value="ds.datastore"
                     x-text="ds.name + (ds.free_space ? ' — ' + Math.round(ds.free_space/1073741824) + ' GB free' : '')">
                   </option>
@@ -2174,7 +2174,7 @@
           <template x-for="[k,v] in [
             ['vSphere Cluster', (vnaWizard.options && (vnaWizard.options.clusters||[]).find(c=>c.cluster===(vnaWizard.form.cluster_moref||(vnaWizard.options.clusters[0]&&vnaWizard.options.clusters[0].cluster)))||{}).name||'(auto)'],
             ['Port Group',  (vnaWizard.options && vnaCurrentPGs().find(p => p.network === vnaWizard.form.port_group_id) || {}).name || vnaWizard.form.port_group_id],
-            ['Datastore',   (vnaWizard.options && (vnaWizard.options.datastores||[]).find(d=>d.datastore===vnaWizard.form.datastore_id)||{}).name||'(auto)'],
+            ['Datastore',   (vnaWizard.options && vnaCurrentDatastores().find(d=>d.datastore===vnaWizard.form.datastore_id)||{}).name||'(auto)'],
             ['Node 1 IP',   vnaWizard.form.ip1 + '/' + vnaEffectivePrefix()],
             ['Node 2 IP',   vnaWizard.form.ip2 + '/' + vnaEffectivePrefix()],
             ['Gateway',     vnaEffectiveGateway()],
@@ -6098,12 +6098,17 @@
           this.vnaWizard.options = d;
           if (d.success) {
             // Cluster: prefer suggested_cluster_moref, else first in list
-            if (d.suggested_cluster_moref)
-              this.vnaWizard.form.cluster_moref = d.suggested_cluster_moref;
-            else if (d.clusters && d.clusters.length >= 1)
-              this.vnaWizard.form.cluster_moref = d.clusters[0].cluster;
-            if (d.datastores && d.datastores.length >= 1)
+            const sugCluster = d.suggested_cluster_moref
+              || (d.clusters && d.clusters.length ? d.clusters[0].cluster : '');
+            this.vnaWizard.form.cluster_moref = sugCluster;
+
+            // Datastore: prefer best DS for the suggested cluster; fall back to global best
+            const clDs = sugCluster && d.cluster_datastores && d.cluster_datastores[sugCluster];
+            if (clDs && clDs.length)
+              this.vnaWizard.form.datastore_id = clDs[0].datastore;
+            else if (d.datastores && d.datastores.length)
               this.vnaWizard.form.datastore_id = d.datastores[0].datastore;
+
             // Port Group: suggested_pg_id (vCenter VM → Edge VM → VNA VM); fallback to vm_mgmt_dvpg
             if (d.suggested_pg_id)
               this.vnaWizard.form.port_group_id = d.suggested_pg_id;
@@ -6122,6 +6127,16 @@
         this.vnaWizard.step = 1;
       },
 
+      // Returns datastores for the currently selected cluster (best-free-space first).
+      // Falls back to the global datastores list when per-cluster data is unavailable.
+      vnaCurrentDatastores() {
+        const opts = this.vnaWizard.options;
+        if (!opts) return [];
+        const selCluster = this.vnaWizard.form.cluster_moref;
+        const clDs = selCluster && opts.cluster_datastores && opts.cluster_datastores[selCluster];
+        return (clDs && clDs.length) ? clDs : (opts.datastores || []);
+      },
+
       // Returns the port groups relevant to the currently selected cluster.
       // When all clusters share the same VDS → return all PGs (no filtering).
       // When clusters use dedicated VDSes → return only PGs for the selected cluster.
@@ -6135,16 +6150,26 @@
       },
 
       // Called when the user changes the vSphere Cluster.
-      // When clusters use different VDSes, clear the PG selection if it doesn't
-      // belong to the newly selected cluster (forces the user to re-pick).
+      // 1. When clusters use different VDSes: clear PG if not on new cluster's VDS.
+      // 2. Always: switch Datastore to best one for the new cluster.
       vnaOnClusterChange() {
         const opts = this.vnaWizard.options;
-        if (!opts || opts.all_same_vds !== false) return;  // same VDS — nothing to do
+        if (!opts) return;
         const selCluster = this.vnaWizard.form.cluster_moref;
-        const clPGs = (opts.cluster_portgroups || {})[selCluster] || [];
-        const curPG  = this.vnaWizard.form.port_group_id;
-        if (curPG && !clPGs.some(pg => pg.network === curPG)) {
-          this.vnaWizard.form.port_group_id = '';  // PG not on this cluster's VDS — clear it
+
+        // ① PG filtering (multi-VDS only)
+        if (opts.all_same_vds === false) {
+          const clPGs = (opts.cluster_portgroups || {})[selCluster] || [];
+          const curPG  = this.vnaWizard.form.port_group_id;
+          if (curPG && !clPGs.some(pg => pg.network === curPG)) {
+            this.vnaWizard.form.port_group_id = '';  // not on this cluster's VDS — clear
+          }
+        }
+
+        // ② Datastore: switch to best DS for the newly selected cluster
+        const clDs = (opts.cluster_datastores || {})[selCluster] || [];
+        if (clDs.length) {
+          this.vnaWizard.form.datastore_id = clDs[0].datastore;
         }
       },
 

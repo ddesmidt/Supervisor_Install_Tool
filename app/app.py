@@ -2755,6 +2755,7 @@ def fix_vna_options():
         "suggested_cluster_source":  None,
         "cluster_vds_map":           {},   # {cluster_moref: vds_name}
         "cluster_portgroups":        {},   # {cluster_moref: [pg_list]}
+        "cluster_datastores":        {},   # {cluster_moref: [ds_list sorted by free space]}
         "all_same_vds":              True,
         "source_cluster_moref":      None,
     }
@@ -3003,21 +3004,24 @@ def fix_vna_options():
 
         # ── Cluster intelligence ──────────────────────────────────────────────
         # Build: per-cluster hosts, per-cluster PGs, per-cluster VDS,
-        #        all_same_vds flag, source_cluster, suggested_cluster.
+        #        per-cluster datastores, all_same_vds flag,
+        #        source_cluster, suggested_cluster.
         try:
-            # 1. Hosts per cluster {cluster_moref: [host_name_lower]}
-            _cl_hosts: dict = {}
+            # 1. Hosts per cluster
+            #    {cluster_moref: {"names": [fqdn_lower], "ids": [host_moref]}}
+            _cl_hosts: dict  = {}   # {cmref: [host_fqdn_lower]}
+            _cl_hids:  dict  = {}   # {cmref: [host_moref]} — for placement.host lookup
             for _cl in result.get("clusters", []):
                 _cmref = _cl.get("cluster", "")
                 if not _cmref:
                     continue
                 _hlist = vc_get(vc_url, token, "/api/vcenter/host",
                                 params={"filter.clusters": _cmref}) or []
-                _cl_hosts[_cmref] = [
-                    (h.get("name") or "").lower() for h in _hlist if h.get("name")
-                ]
+                _cl_hosts[_cmref] = [(h.get("name") or "").lower()
+                                     for h in _hlist if h.get("name")]
+                _cl_hids[_cmref]  = [h.get("host", "") for h in _hlist]
 
-            # 2. Per-cluster port groups (filtered by cluster → VDS scope)
+            # 2. Per-cluster port groups (scoped to each cluster's VDS)
             _cl_pgs: dict = {}
             for _cmref in _cl_hosts:
                 _pgs = vc_get(vc_url, token, "/api/vcenter/network",
@@ -3026,7 +3030,16 @@ def fix_vna_options():
                 _cl_pgs[_cmref] = _pgs
             result["cluster_portgroups"] = _cl_pgs
 
-            # 3. VDS per cluster (via NSX HTN host_switch_name)
+            # 3. Per-cluster datastores (sorted best-free-space first)
+            _cl_ds: dict = {}
+            for _cmref in _cl_hosts:
+                _dsr = vc_get(vc_url, token, "/api/vcenter/datastore",
+                              params={"filter.clusters": _cmref}) or []
+                _cl_ds[_cmref] = sorted(_dsr,
+                    key=lambda d: d.get("free_space", 0), reverse=True)
+            result["cluster_datastores"] = _cl_ds
+
+            # 4. VDS per cluster (via NSX HTN host_switch_name)
             _cl_vds: dict = {}
             if nsx_url:
                 _ep_ht2 = ("/policy/api/v1/infra/sites/default/enforcement-points"
@@ -3050,25 +3063,44 @@ def fix_vna_options():
                             break
             result["cluster_vds_map"] = _cl_vds
 
-            # 4. Are all clusters on the same VDS?
+            # 5. Are all clusters on the same VDS?
             _uniq_vds = set(_cl_vds.values())
             _all_same = len(_uniq_vds) <= 1
             result["all_same_vds"] = _all_same
 
-            # 5. Source cluster (where the pre-selected VM lives)
+            # 6. Source cluster (where the pre-selected VM lives)
             _src_cluster = None
             _pg_src = result.get("suggested_pg_source", "")
             if _pg_src == "vCenter VM" and _src_vm_id:
-                # Direct lookup: GET /api/vcenter/vm/{id} → placement.cluster
+                # Strategy A: GET /api/vcenter/vm/{id} → placement.cluster
                 try:
-                    _vm_det = vc_get(vc_url, token, f"/api/vcenter/vm/{_src_vm_id}") or {}
-                    _sc = (_vm_det.get("placement") or {}).get("cluster")
+                    _vm_det   = vc_get(vc_url, token,
+                                       f"/api/vcenter/vm/{_src_vm_id}") or {}
+                    _placement = _vm_det.get("placement") or {}
+                    _sc = _placement.get("cluster")
                     if _sc:
                         _src_cluster = _sc
+                    else:
+                        # Strategy B: match placement.host (moref) against
+                        # the per-cluster host moref lists
+                        _vm_host_moref = _placement.get("host", "")
+                        if _vm_host_moref:
+                            for _cmref, _hids in _cl_hids.items():
+                                if _vm_host_moref in _hids:
+                                    _src_cluster = _cmref
+                                    break
                 except Exception:
                     pass
+                # Strategy C (last resort): find the cluster whose PG list
+                # contains the pre-selected port group
+                if not _src_cluster and result.get("suggested_pg_id"):
+                    _spg = result["suggested_pg_id"]
+                    for _cmref, _pgs in _cl_pgs.items():
+                        if any(p.get("network") == _spg for p in _pgs):
+                            _src_cluster = _cmref
+                            break
             elif _pg_src in ("Edge VM", "VNA VM") and _src_etn_name:
-                # Match ETN hostname against cluster hosts list
+                # Match ETN hostname against cluster host FQDNs
                 for _cmref, _hnames in _cl_hosts.items():
                     if any(_src_etn_name == _hn or
                            _src_etn_name.startswith(_hn) or
@@ -3076,22 +3108,39 @@ def fix_vna_options():
                            for _hn in _hnames):
                         _src_cluster = _cmref
                         break
+                # Fallback: find via PG list
+                if not _src_cluster and result.get("suggested_pg_id"):
+                    _spg = result["suggested_pg_id"]
+                    for _cmref, _pgs in _cl_pgs.items():
+                        if any(p.get("network") == _spg for p in _pgs):
+                            _src_cluster = _cmref
+                            break
             result["source_cluster_moref"] = _src_cluster
 
-            # 6. Suggested cluster
-            _sugg_cl = None
+            # 7. Suggested cluster
+            _sugg_cl  = None
             _sugg_why = None
             if _all_same:
-                # Pick the cluster with the most hosts (resource proxy)
+                # All clusters share one VDS → pick the one with the most hosts
                 if _cl_hosts:
-                    _best = max(_cl_hosts.items(), key=lambda x: len(x[1]))
+                    _best     = max(_cl_hosts.items(), key=lambda x: len(x[1]))
                     _sugg_cl  = _best[0]
                     _sugg_why = "most hosts"
             else:
-                # Pick the cluster where the source VM lives
+                # Dedicated VDSes → MUST use the source VM's cluster
                 if _src_cluster:
                     _sugg_cl  = _src_cluster
                     _sugg_why = f"{_pg_src}'s cluster"
+                else:
+                    # _src_cluster still None (e.g. NSX not configured):
+                    # fallback to the cluster that contains the suggested PG
+                    if result.get("suggested_pg_id"):
+                        _spg = result["suggested_pg_id"]
+                        for _cmref, _pgs in _cl_pgs.items():
+                            if any(p.get("network") == _spg for p in _pgs):
+                                _sugg_cl  = _cmref
+                                _sugg_why = "PG's cluster"
+                                break
             result["suggested_cluster_moref"]  = _sugg_cl
             result["suggested_cluster_source"] = _sugg_why
 
