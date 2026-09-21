@@ -4654,8 +4654,9 @@ def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, 
     """
     PowerCLI: creates DVPortGroup (unless pg_already_exists) + one vmk per host.
     host_ips: list of (fqdn, ip_str, mask_str) tuples.
-    Returns (vmk_map, pg_created, error_str)
-      vmk_map: {fqdn: vmk_name}
+    Returns (vmk_map, pg_created, error_str, vmk_errors)
+      vmk_map:    {fqdn: vmk_name}   — hosts that succeeded
+      vmk_errors: {fqdn: error_msg}  — hosts that failed with their actual PowerCLI error
     """
     import subprocess, tempfile, os, textwrap, re
     vc_host = vc_url.replace("https://", "").replace("http://", "").rstrip("/")
@@ -4717,19 +4718,24 @@ def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, 
         # Strip ANSI escape codes so error messages are readable
         out = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', out)
         if "PCLI_SETUP_DONE" not in out:
-            return {}, False, f"PowerCLI setup failed (no DONE marker):\n{out[:2000]}"
+            return {}, False, f"PowerCLI setup failed (no DONE marker):\n{out[:2000]}", {}
         pg_created = "PG:CREATED:" in out
-        vmk_map = {}
+        vmk_map    = {}
+        vmk_errors = {}
         for line in out.splitlines():
             if line.startswith("VMK:"):
                 parts = line.split(":", 2)
                 if len(parts) == 3:
                     vmk_map[parts[1]] = parts[2].strip()
-        return vmk_map, pg_created, ""
+            elif line.startswith("VMK_ERR:"):
+                parts = line.split(":", 2)
+                if len(parts) == 3:
+                    vmk_errors[parts[1]] = parts[2].strip()
+        return vmk_map, pg_created, "", vmk_errors
     except FileNotFoundError:
-        return {}, False, "PowerShell (pwsh) not found — install via: snap install powershell --classic"
+        return {}, False, "PowerShell (pwsh) not found — install via: snap install powershell --classic", {}
     except subprocess.TimeoutExpired:
-        return {}, False, "PowerCLI timed out during setup (>150s)"
+        return {}, False, "PowerCLI timed out during setup (>150s)", {}
     finally:
         try: os.unlink(script_path)
         except Exception: pass
@@ -5884,7 +5890,7 @@ def check_vlan():
         # the other hosts' temp IPs exist on the VLAN — any response is a
         # real server, not our own vmknic.
         pg_name = f"vcf-vlan-check-{vlan_id}"
-        vmk_map, _pg_created, setup_err = _pcli_setup_vlan_test(
+        vmk_map, _pg_created, setup_err, vmk_errors = _pcli_setup_vlan_test(
             vc_url, vc_user, vc_pass, nsx_vds_name, pg_name, vlan_id,
             [(hosts[0], temp_ips[0], mask_str)])
         if setup_err:
@@ -6033,11 +6039,12 @@ def check_vlan():
         # ── 5c. Phase 2: vmknics for hosts 1-N ────────────────────────────
         if len(hosts) > 1:
             _ph2_arg = [(hosts[i], temp_ips[i], mask_str) for i in range(1, len(hosts))]
-            _vmk2, _, _err2 = _pcli_setup_vlan_test(
+            _vmk2, _, _err2, _verr2 = _pcli_setup_vlan_test(
                 vc_url, vc_user, vc_pass, nsx_vds_name, pg_name, vlan_id,
                 _ph2_arg, pg_already_exists=True)
             if not _err2:
                 vmk_map.update(_vmk2)
+                vmk_errors.update(_verr2)
 
         # ── 6. Per-host: SSH → gateway ping ───────────────────────────────
         for idx, fqdn in enumerate(hosts):
@@ -6059,8 +6066,13 @@ def check_vlan():
 
             try:
                 if not vmk_dev:
-                    test["error"] = (f"PowerCLI failed to create vmk on {fqdn}. "
-                                     f"Check PowerCLI setup output for VMK_ERR lines.")
+                    _pcli_err_detail = vmk_errors.get(fqdn, "")
+                    if _pcli_err_detail:
+                        test["error"] = (f"PowerCLI failed to create vmk on {fqdn}: "
+                                         f"{_pcli_err_detail}")
+                    else:
+                        test["error"] = (f"PowerCLI failed to create vmk on {fqdn}. "
+                                         f"Check PowerCLI setup output for VMK_ERR lines.")
                     test["output"] = "\n".join(steps); continue
 
                 steps.append(f"✓ vmk created via PowerCLI: {vmk_dev} with IP {temp_ip}/{prefix_len}")
