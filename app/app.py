@@ -2750,9 +2750,19 @@ def fix_vna_options():
         # suggested port group (priority: vCenter VM > Edge VM > VNA VM)
         "suggested_pg_id":     None,
         "suggested_pg_source": None,
+        # cluster intelligence
+        "suggested_cluster_moref":   None,
+        "suggested_cluster_source":  None,
+        "cluster_vds_map":           {},   # {cluster_moref: vds_name}
+        "cluster_portgroups":        {},   # {cluster_moref: [pg_list]}
+        "all_same_vds":              True,
+        "source_cluster_moref":      None,
     }
     try:
         token, _ = vc_auth(vc_url, username, password)
+        # Will be set by the priority blocks for cluster lookup later
+        _src_vm_id    = None   # vCenter VM moref (Priority 1)
+        _src_etn_name = None   # ETN display_name/hostname (Priority 2 or 3)
 
         result["port_groups"] = vc_get(
             vc_url, token, "/api/vcenter/network",
@@ -2811,6 +2821,7 @@ def fix_vna_options():
                     if _pg2:
                         result["suggested_pg_id"]     = _pg2
                         result["suggested_pg_source"]  = "vCenter VM"
+                        _src_vm_id = _vm_id2   # save for cluster lookup
         except Exception:
             pass
 
@@ -2975,6 +2986,8 @@ def fix_vna_options():
                     if _pg3:
                         result["suggested_pg_id"]    = _pg3
                         result["suggested_pg_source"] = "Edge VM"
+                        _src_etn_name = (_edge3.get("display_name") or
+                                         _edge3.get("hostname") or "").lower()
                 # Priority 3: first VNA ETN → VNA VM
                 if not result["suggested_pg_id"]:
                     _vna3 = next((e for e in _all_etns3 if e.get("id") in _vna_ids2), None)
@@ -2983,8 +2996,107 @@ def fix_vna_options():
                         if _pg3:
                             result["suggested_pg_id"]    = _pg3
                             result["suggested_pg_source"] = "VNA VM"
+                            _src_etn_name = (_vna3.get("display_name") or
+                                             _vna3.get("hostname") or "").lower()
             except Exception:
                 pass
+
+        # ── Cluster intelligence ──────────────────────────────────────────────
+        # Build: per-cluster hosts, per-cluster PGs, per-cluster VDS,
+        #        all_same_vds flag, source_cluster, suggested_cluster.
+        try:
+            # 1. Hosts per cluster {cluster_moref: [host_name_lower]}
+            _cl_hosts: dict = {}
+            for _cl in result.get("clusters", []):
+                _cmref = _cl.get("cluster", "")
+                if not _cmref:
+                    continue
+                _hlist = vc_get(vc_url, token, "/api/vcenter/host",
+                                params={"filter.clusters": _cmref}) or []
+                _cl_hosts[_cmref] = [
+                    (h.get("name") or "").lower() for h in _hlist if h.get("name")
+                ]
+
+            # 2. Per-cluster port groups (filtered by cluster → VDS scope)
+            _cl_pgs: dict = {}
+            for _cmref in _cl_hosts:
+                _pgs = vc_get(vc_url, token, "/api/vcenter/network",
+                              params={"types": "DISTRIBUTED_PORTGROUP",
+                                      "filter.clusters": _cmref}) or []
+                _cl_pgs[_cmref] = _pgs
+            result["cluster_portgroups"] = _cl_pgs
+
+            # 3. VDS per cluster (via NSX HTN host_switch_name)
+            _cl_vds: dict = {}
+            if nsx_url:
+                _ep_ht2 = ("/policy/api/v1/infra/sites/default/enforcement-points"
+                           "/default/host-transport-nodes")
+                _htn2 = (nsx_get(nsx_url, nsx_user, nsx_pass,
+                                 _ep_ht2) or {}).get("results", [])
+                _fqdn_vds2: dict = {}
+                for _h2 in _htn2:
+                    _hf = (((_h2.get("node_deployment_info") or {}).get("fqdn") or
+                            _h2.get("display_name") or "")).lower()
+                    for _hs2 in (_h2.get("host_switch_spec") or {}).get("host_switches") or []:
+                        _vn2 = _hs2.get("host_switch_name", "")
+                        if _vn2 and _hf:
+                            _fqdn_vds2[_hf] = _vn2
+                            break
+                for _cmref, _hnames in _cl_hosts.items():
+                    for _hn in _hnames:
+                        _vn2 = _fqdn_vds2.get(_hn)
+                        if _vn2:
+                            _cl_vds[_cmref] = _vn2
+                            break
+            result["cluster_vds_map"] = _cl_vds
+
+            # 4. Are all clusters on the same VDS?
+            _uniq_vds = set(_cl_vds.values())
+            _all_same = len(_uniq_vds) <= 1
+            result["all_same_vds"] = _all_same
+
+            # 5. Source cluster (where the pre-selected VM lives)
+            _src_cluster = None
+            _pg_src = result.get("suggested_pg_source", "")
+            if _pg_src == "vCenter VM" and _src_vm_id:
+                # Direct lookup: GET /api/vcenter/vm/{id} → placement.cluster
+                try:
+                    _vm_det = vc_get(vc_url, token, f"/api/vcenter/vm/{_src_vm_id}") or {}
+                    _sc = (_vm_det.get("placement") or {}).get("cluster")
+                    if _sc:
+                        _src_cluster = _sc
+                except Exception:
+                    pass
+            elif _pg_src in ("Edge VM", "VNA VM") and _src_etn_name:
+                # Match ETN hostname against cluster hosts list
+                for _cmref, _hnames in _cl_hosts.items():
+                    if any(_src_etn_name == _hn or
+                           _src_etn_name.startswith(_hn) or
+                           _hn.startswith(_src_etn_name)
+                           for _hn in _hnames):
+                        _src_cluster = _cmref
+                        break
+            result["source_cluster_moref"] = _src_cluster
+
+            # 6. Suggested cluster
+            _sugg_cl = None
+            _sugg_why = None
+            if _all_same:
+                # Pick the cluster with the most hosts (resource proxy)
+                if _cl_hosts:
+                    _best = max(_cl_hosts.items(), key=lambda x: len(x[1]))
+                    _sugg_cl  = _best[0]
+                    _sugg_why = "most hosts"
+            else:
+                # Pick the cluster where the source VM lives
+                if _src_cluster:
+                    _sugg_cl  = _src_cluster
+                    _sugg_why = f"{_pg_src}'s cluster"
+            result["suggested_cluster_moref"]  = _sugg_cl
+            result["suggested_cluster_source"] = _sugg_why
+
+        except Exception:
+            pass   # keep defaults set in result dict initialisation
 
         result["success"] = True
 

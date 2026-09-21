@@ -2036,23 +2036,67 @@
         <div x-show="vnaWizard.step === 1 && vnaWizard.options && vnaWizard.options.success"
              class="modal-body" style="flex:1;">
 
+          <!-- ① vSphere Cluster — moved to top; drives PG list when multi-VDS -->
+          <div class="clr-form-control" style="margin-bottom:0.75rem;">
+            <label class="clr-control-label" style="font-size:0.68rem;">vSphere Cluster</label>
+            <div class="clr-control-container"><div class="clr-select-wrapper">
+              <select x-model="vnaWizard.form.cluster_moref" class="clr-select"
+                      @change="vnaOnClusterChange()">
+                <template x-for="c in (vnaWizard.options ? vnaWizard.options.clusters : [])" :key="c.cluster">
+                  <option :value="c.cluster" x-text="c.name"></option>
+                </template>
+              </select>
+            </div></div>
+            <p x-show="vnaWizard.options && vnaWizard.options.suggested_cluster_moref &&
+                        vnaWizard.form.cluster_moref === vnaWizard.options.suggested_cluster_moref"
+               style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
+              <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
+              Auto-selected: <span x-text="vnaWizard.options && vnaWizard.options.suggested_cluster_source"></span>
+            </p>
+          </div>
+
+          <!-- ② Port Group — filtered to selected cluster's VDS when multi-VDS -->
           <div class="clr-form-control" style="margin-bottom:0.75rem;">
             <label class="clr-control-label" style="font-size:0.68rem;">Port Group (management VLAN)</label>
             <div class="clr-control-container"><div class="clr-select-wrapper">
               <select x-model="vnaWizard.form.port_group_id" class="clr-select">
                 <option value="">— select —</option>
-                <template x-for="pg in (vnaWizard.options ? vnaWizard.options.port_groups : [])" :key="pg.network">
+                <template x-for="pg in vnaCurrentPGs()" :key="pg.network">
                   <option :value="pg.network" x-text="pg.name"></option>
                 </template>
               </select>
             </div></div>
-            <p x-show="vnaWizard.options && vnaWizard.options.suggested_pg_id && vnaWizard.form.port_group_id === vnaWizard.options.suggested_pg_id"
+            <!-- Auto-discovered hint -->
+            <p x-show="vnaWizard.options && vnaWizard.options.suggested_pg_id &&
+                        vnaWizard.form.port_group_id === vnaWizard.options.suggested_pg_id"
                style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
               <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
               Auto-discovered from <span x-text="vnaWizard.options && vnaWizard.options.suggested_pg_source"></span>
             </p>
+            <!-- Multi-VDS: prompt user to pick PG after cluster change -->
+            <p x-show="vnaWizard.options && !vnaWizard.options.all_same_vds &&
+                        !vnaWizard.form.port_group_id"
+               style="font-size:0.68rem; color:#e8a000; margin:0.2rem 0 0 0;">
+              <i class="fas fa-exclamation-triangle" style="margin-right:0.25rem;"></i>
+              Select the Port Group for this cluster's VDS
+            </p>
           </div>
 
+          <!-- ③ Datastore -->
+          <div class="clr-form-control" style="margin-bottom:0.75rem;">
+            <label class="clr-control-label" style="font-size:0.68rem;">Datastore</label>
+            <div class="clr-control-container"><div class="clr-select-wrapper">
+              <select x-model="vnaWizard.form.datastore_id" class="clr-select">
+                <template x-for="ds in (vnaWizard.options ? vnaWizard.options.datastores : [])" :key="ds.datastore">
+                  <option :value="ds.datastore"
+                    x-text="ds.name + (ds.free_space ? ' — ' + Math.round(ds.free_space/1073741824) + ' GB free' : '')">
+                  </option>
+                </template>
+              </select>
+            </div></div>
+          </div>
+
+          <!-- ④ Node IPs — moved to bottom -->
           <div class="clr-row">
             <div class="clr-col-6">
               <div class="clr-form-control" style="margin-bottom:0.75rem;">
@@ -2070,32 +2114,6 @@
                 </div></div>
               </div>
             </div>
-          </div>
-
-          <!-- vSphere Cluster — always a dropdown, first cluster pre-selected -->
-          <div class="clr-form-control" style="margin-bottom:0.75rem;">
-            <label class="clr-control-label" style="font-size:0.68rem;">vSphere Cluster</label>
-            <div class="clr-control-container"><div class="clr-select-wrapper">
-              <select x-model="vnaWizard.form.cluster_moref" class="clr-select">
-                <template x-for="c in (vnaWizard.options ? vnaWizard.options.clusters : [])" :key="c.cluster">
-                  <option :value="c.cluster" x-text="c.name"></option>
-                </template>
-              </select>
-            </div></div>
-          </div>
-
-          <!-- Datastore — always a dropdown, pre-selected to most free space -->
-          <div class="clr-form-control" style="margin-bottom:0.75rem;">
-            <label class="clr-control-label" style="font-size:0.68rem;">Datastore</label>
-            <div class="clr-control-container"><div class="clr-select-wrapper">
-              <select x-model="vnaWizard.form.datastore_id" class="clr-select">
-                <template x-for="ds in (vnaWizard.options ? vnaWizard.options.datastores : [])" :key="ds.datastore">
-                  <option :value="ds.datastore"
-                    x-text="ds.name + (ds.free_space ? ' — ' + Math.round(ds.free_space/1073741824) + ' GB free' : '')">
-                  </option>
-                </template>
-              </select>
-            </div></div>
           </div>
 
         </div>
@@ -2154,14 +2172,14 @@
         <div x-show="vnaWizard.step === 3" class="modal-body" style="flex:1;">
           <p style="font-size:0.85rem; font-weight:600; color:#2b2b2b; margin-bottom:0.75rem;">Review before deploying:</p>
           <template x-for="[k,v] in [
-            ['Port Group',  (vnaWizard.options && vnaWizard.options.port_groups.find(p => p.network === vnaWizard.form.port_group_id) || {}).name || vnaWizard.form.port_group_id],
+            ['vSphere Cluster', (vnaWizard.options && (vnaWizard.options.clusters||[]).find(c=>c.cluster===(vnaWizard.form.cluster_moref||(vnaWizard.options.clusters[0]&&vnaWizard.options.clusters[0].cluster)))||{}).name||'(auto)'],
+            ['Port Group',  (vnaWizard.options && vnaCurrentPGs().find(p => p.network === vnaWizard.form.port_group_id) || {}).name || vnaWizard.form.port_group_id],
+            ['Datastore',   (vnaWizard.options && (vnaWizard.options.datastores||[]).find(d=>d.datastore===vnaWizard.form.datastore_id)||{}).name||'(auto)'],
             ['Node 1 IP',   vnaWizard.form.ip1 + '/' + vnaEffectivePrefix()],
             ['Node 2 IP',   vnaWizard.form.ip2 + '/' + vnaEffectivePrefix()],
             ['Gateway',     vnaEffectiveGateway()],
             ['DNS',         vnaEffectiveDns()],
             ['NTP',         vnaEffectiveNtp()],
-            ['vSphere Cluster', (vnaWizard.options && (vnaWizard.options.clusters||[]).find(c=>c.cluster===(vnaWizard.form.cluster_moref||(vnaWizard.options.clusters[0]&&vnaWizard.options.clusters[0].cluster)))||{}).name||'(auto)'],
-            ['Datastore',   (vnaWizard.options && (vnaWizard.options.datastores||[]).find(d=>d.datastore===vnaWizard.form.datastore_id)||{}).name||'(auto)'],
           ]" :key="k">
             <div style="display:flex; justify-content:space-between; font-size:0.8rem; border-bottom:1px solid #dfe3e6; padding:0.45rem 0;">
               <span style="color:#6e777b; flex-shrink:0; width:7rem;" x-text="k"></span>
@@ -6079,11 +6097,14 @@
           const d = await r.json();
           this.vnaWizard.options = d;
           if (d.success) {
-            if (d.clusters && d.clusters.length >= 1)
+            // Cluster: prefer suggested_cluster_moref, else first in list
+            if (d.suggested_cluster_moref)
+              this.vnaWizard.form.cluster_moref = d.suggested_cluster_moref;
+            else if (d.clusters && d.clusters.length >= 1)
               this.vnaWizard.form.cluster_moref = d.clusters[0].cluster;
             if (d.datastores && d.datastores.length >= 1)
               this.vnaWizard.form.datastore_id = d.datastores[0].datastore;
-            // Priority: suggested_pg_id (vCenter VM → Edge VM → VNA VM); fallback to vm_mgmt_dvpg
+            // Port Group: suggested_pg_id (vCenter VM → Edge VM → VNA VM); fallback to vm_mgmt_dvpg
             if (d.suggested_pg_id)
               this.vnaWizard.form.port_group_id = d.suggested_pg_id;
             else if (d.vm_mgmt_dvpg)
@@ -6099,6 +6120,32 @@
           this.vnaWizard.options = {success: false, error: String(e)};
         }
         this.vnaWizard.step = 1;
+      },
+
+      // Returns the port groups relevant to the currently selected cluster.
+      // When all clusters share the same VDS → return all PGs (no filtering).
+      // When clusters use dedicated VDSes → return only PGs for the selected cluster.
+      vnaCurrentPGs() {
+        const opts = this.vnaWizard.options;
+        if (!opts) return [];
+        if (opts.all_same_vds !== false) return opts.port_groups || [];
+        const selCluster = this.vnaWizard.form.cluster_moref;
+        const clPGs = (opts.cluster_portgroups || {})[selCluster];
+        return clPGs || opts.port_groups || [];
+      },
+
+      // Called when the user changes the vSphere Cluster.
+      // When clusters use different VDSes, clear the PG selection if it doesn't
+      // belong to the newly selected cluster (forces the user to re-pick).
+      vnaOnClusterChange() {
+        const opts = this.vnaWizard.options;
+        if (!opts || opts.all_same_vds !== false) return;  // same VDS — nothing to do
+        const selCluster = this.vnaWizard.form.cluster_moref;
+        const clPGs = (opts.cluster_portgroups || {})[selCluster] || [];
+        const curPG  = this.vnaWizard.form.port_group_id;
+        if (curPG && !clPGs.some(pg => pg.network === curPG)) {
+          this.vnaWizard.form.port_group_id = '';  // PG not on this cluster's VDS — clear it
+        }
       },
 
       ipInSubnet(ip, cidr) {
