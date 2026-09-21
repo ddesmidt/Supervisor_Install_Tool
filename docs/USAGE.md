@@ -159,8 +159,19 @@ The following steps have automated Fix wizards:
 
 When you click **Fix** on R4 Distributed, a 3-step wizard opens:
 
-1. **Node IPs** — Select the port group, enter the two management IPs (one per VNA node). The vSphere cluster and datastore are auto-selected.
-2. **Network settings** — If the IPs are in the same subnet as the vCenter management network, no extra input is needed. Otherwise, enter the subnet prefix, gateway, and DNS.
+1. **Node IPs** — The wizard auto-discovers recommended values for the three key fields:
+
+   | Field | Auto-selection logic |
+   |---|---|
+   | **vSphere Cluster** | The cluster that hosts the vCenter VM (priority 1), or the Edge VM's cluster, or the VNA VM's cluster. In a single-VDS environment the cluster with the most hosts is suggested instead. |
+   | **Port Group** | The port group of the vCenter VM's first vNIC (priority 1), or the Edge VM's management port group, or the VNA VM's management port group. Shown with a green *"Auto-selected from vCenter VM's Port Group"* note. |
+   | **Datastore** | The datastore with the most free space on the selected cluster. |
+
+   In environments with **multiple clusters and dedicated VDSes per cluster**, the Port Group dropdown is automatically scoped to only the port groups that belong to the selected cluster's VDS. Switching the cluster clears the port group selection if it no longer belongs to the new cluster's VDS, and an orange prompt reminds you to re-select.
+
+   Enter the two management IPs (one per VNA node).
+
+2. **Network settings** — If the node IPs are in the same subnet as the vCenter management network, subnet prefix and gateway are filled in automatically. Otherwise enter the subnet prefix (e.g. 24), gateway, DNS, and NTP servers.
 3. **Confirm** — Review the settings and click **"Deploy VNA Cluster"**.
 
 After clicking Deploy, the wizard shows live progress (polled every 30 seconds). Deployment typically takes 15–20 minutes.
