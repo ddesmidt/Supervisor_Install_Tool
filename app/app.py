@@ -3069,52 +3069,57 @@ def fix_vna_options():
             result["all_same_vds"] = _all_same
 
             # 6. Source cluster (where the pre-selected VM lives)
+            # NOTE: GET /api/vcenter/vm/{id} does NOT return placement in its
+            # response (placement is a write-only spec). We instead iterate
+            # over clusters and ask "which one contains this VM moref?"
             _src_cluster = None
             _pg_src = result.get("suggested_pg_source", "")
+
             if _pg_src == "vCenter VM" and _src_vm_id:
-                # Strategy A: GET /api/vcenter/vm/{id} → placement.cluster
+                # Strategy A: GET /api/vcenter/vm?filter.clusters={c} per cluster
+                # — returns only VMs hosted in that cluster, reliable & fast.
                 try:
-                    _vm_det   = vc_get(vc_url, token,
-                                       f"/api/vcenter/vm/{_src_vm_id}") or {}
-                    _placement = _vm_det.get("placement") or {}
-                    _sc = _placement.get("cluster")
-                    if _sc:
-                        _src_cluster = _sc
-                    else:
-                        # Strategy B: match placement.host (moref) against
-                        # the per-cluster host moref lists
-                        _vm_host_moref = _placement.get("host", "")
-                        if _vm_host_moref:
-                            for _cmref, _hids in _cl_hids.items():
-                                if _vm_host_moref in _hids:
-                                    _src_cluster = _cmref
-                                    break
+                    for _cmref_a in list(_cl_hosts.keys()):
+                        _vms_a = vc_get(vc_url, token, "/api/vcenter/vm",
+                                        params={"filter.clusters": _cmref_a}) or []
+                        if any(v.get("vm") == _src_vm_id for v in _vms_a):
+                            _src_cluster = _cmref_a
+                            break
                 except Exception:
                     pass
-                # Strategy C (last resort): find the cluster whose PG list
-                # contains the pre-selected port group
+
+                # Strategy B (fallback): find the unique cluster whose PG list
+                # exclusively contains the suggested PG (only works when the PG
+                # is truly absent from other clusters' VDSes).
                 if not _src_cluster and result.get("suggested_pg_id"):
                     _spg = result["suggested_pg_id"]
-                    for _cmref, _pgs in _cl_pgs.items():
-                        if any(p.get("network") == _spg for p in _pgs):
-                            _src_cluster = _cmref
-                            break
+                    _hits = [c for c, pgs in _cl_pgs.items()
+                             if any(p.get("network") == _spg for p in pgs)]
+                    if len(_hits) == 1:
+                        _src_cluster = _hits[0]
+
             elif _pg_src in ("Edge VM", "VNA VM") and _src_etn_name:
-                # Match ETN hostname against cluster host FQDNs
-                for _cmref, _hnames in _cl_hosts.items():
+                # Match ETN hostname (may be short or FQDN) against cluster hosts
+                for _cmref_e, _hnames_e in _cl_hosts.items():
                     if any(_src_etn_name == _hn or
-                           _src_etn_name.startswith(_hn) or
-                           _hn.startswith(_src_etn_name)
-                           for _hn in _hnames):
-                        _src_cluster = _cmref
+                           _src_etn_name.startswith(_hn.split(".")[0]) or
+                           _hn.startswith(_src_etn_name.split(".")[0])
+                           for _hn in _hnames_e):
+                        _src_cluster = _cmref_e
                         break
-                # Fallback: find via PG list
-                if not _src_cluster and result.get("suggested_pg_id"):
-                    _spg = result["suggested_pg_id"]
-                    for _cmref, _pgs in _cl_pgs.items():
-                        if any(p.get("network") == _spg for p in _pgs):
-                            _src_cluster = _cmref
-                            break
+                # Fallback via VM filter for the ETN's host (if hostname didn't match)
+                if not _src_cluster and _src_etn_name:
+                    try:
+                        for _cmref_e in list(_cl_hosts.keys()):
+                            _hosts_e = vc_get(vc_url, token, "/api/vcenter/host",
+                                              params={"filter.clusters": _cmref_e}) or []
+                            if any(_src_etn_name in (h.get("name") or "").lower() or
+                                   (h.get("name") or "").lower() in _src_etn_name
+                                   for h in _hosts_e):
+                                _src_cluster = _cmref_e
+                                break
+                    except Exception:
+                        pass
             result["source_cluster_moref"] = _src_cluster
 
             # 7. Suggested cluster
@@ -3132,15 +3137,15 @@ def fix_vna_options():
                     _sugg_cl  = _src_cluster
                     _sugg_why = f"{_pg_src}'s cluster"
                 else:
-                    # _src_cluster still None (e.g. NSX not configured):
-                    # fallback to the cluster that contains the suggested PG
+                    # Last resort: pick the cluster whose PG list uniquely
+                    # contains the suggested PG (same as Strategy B above)
                     if result.get("suggested_pg_id"):
                         _spg = result["suggested_pg_id"]
-                        for _cmref, _pgs in _cl_pgs.items():
-                            if any(p.get("network") == _spg for p in _pgs):
-                                _sugg_cl  = _cmref
-                                _sugg_why = "PG's cluster"
-                                break
+                        _hits2 = [c for c, pgs in _cl_pgs.items()
+                                  if any(p.get("network") == _spg for p in pgs)]
+                        if len(_hits2) == 1:
+                            _sugg_cl  = _hits2[0]
+                            _sugg_why = "PG's cluster"
             result["suggested_cluster_moref"]  = _sugg_cl
             result["suggested_cluster_source"] = _sugg_why
 
