@@ -2046,10 +2046,10 @@
                 </template>
               </select>
             </div></div>
-            <p x-show="vnaWizard.options && vnaWizard.options.vm_mgmt_dvpg && vnaWizard.form.port_group_id === vnaWizard.options.vm_mgmt_dvpg"
+            <p x-show="vnaWizard.options && vnaWizard.options.suggested_pg_id && vnaWizard.form.port_group_id === vnaWizard.options.suggested_pg_id"
                style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
               <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
-              Auto-discovered from vCenter VM
+              Auto-discovered from <span x-text="vnaWizard.options && vnaWizard.options.suggested_pg_source"></span>
             </p>
           </div>
 
@@ -2104,12 +2104,13 @@
         <div x-show="vnaWizard.step === 2" class="modal-body" style="flex:1;">
 
           <!-- Corner-case: same VDS Port Group as vCenter but IPs from a different subnet -->
-          <div x-show="vnaWizard.options && vnaWizard.form.port_group_id === vnaWizard.options.vm_mgmt_dvpg && !vnaIpsSameSubnet()"
+          <div x-show="vnaWizard.options && (vnaWizard.form.port_group_id === vnaWizard.options.suggested_pg_id || vnaWizard.form.port_group_id === vnaWizard.options.vm_mgmt_dvpg) && !vnaIpsSameSubnet()"
                class="alert alert-warning alert-sm" style="margin-bottom:0.9rem;">
             <div class="alert-items"><div class="alert-item static">
               <clr-icon shape="warning-standard" class="alert-icon"></clr-icon>
               <span class="alert-text">
-                The VNA Nodes will be plugged in the same VDS Port Group as vCenter,
+                The VNA Nodes will be plugged in the same VDS Port Group as
+                <span x-text="(vnaWizard.options && vnaWizard.options.suggested_pg_source) || 'vCenter VM'"></span>,
                 but their IPs are not in the vCenter management subnet
                 (<span style="font-family:monospace;" x-text="vnaWizard.options && vnaWizard.options.vc_subnet"></span>).
                 Are you really sure?
@@ -6082,7 +6083,10 @@
               this.vnaWizard.form.cluster_moref = d.clusters[0].cluster;
             if (d.datastores && d.datastores.length >= 1)
               this.vnaWizard.form.datastore_id = d.datastores[0].datastore;
-            if (d.vm_mgmt_dvpg)
+            // Priority: suggested_pg_id (vCenter VM → Edge VM → VNA VM); fallback to vm_mgmt_dvpg
+            if (d.suggested_pg_id)
+              this.vnaWizard.form.port_group_id = d.suggested_pg_id;
+            else if (d.vm_mgmt_dvpg)
               this.vnaWizard.form.port_group_id = d.vm_mgmt_dvpg;
             if (d.overlay_tz_path)
               this.vnaWizard.form.overlay_tz_path = d.overlay_tz_path;

@@ -2747,6 +2747,9 @@ def fix_vna_options():
         # auto-discovered NSX fields
         "overlay_tz_path": None,
         "vm_mgmt_dvpg":    None,
+        # suggested port group (priority: vCenter VM > Edge VM > VNA VM)
+        "suggested_pg_id":     None,
+        "suggested_pg_source": None,
     }
     try:
         token, _ = vc_auth(vc_url, username, password)
@@ -2758,6 +2761,58 @@ def fix_vna_options():
         ds_raw = vc_get(vc_url, token, "/api/vcenter/datastore") or []
         result["datastores"] = sorted(ds_raw,
                                       key=lambda d: d.get("free_space", 0), reverse=True)
+
+        # ── Priority 1: vCenter VM port group ────────────────────────────────────
+        try:
+            from urllib.parse import urlparse as _ulp
+            _url_host2 = (_ulp(vc_url).hostname or "")
+            _url_is_ip2 = False
+            try:
+                import ipaddress as _ipa2
+                _ipa2.ip_address(_url_host2)
+                _url_is_ip2 = True
+            except ValueError:
+                pass
+            _vc_short2  = "" if _url_is_ip2 else _url_host2.split(".")[0].lower()
+            _vc_own_ip2 = _url_host2 if _url_is_ip2 else None
+            _all_vms2   = vc_get(vc_url, token, "/api/vcenter/vm") or []
+            _vc_vm2     = None
+            # Strategy A — name match
+            if _vc_short2:
+                _vc_vm2 = next(
+                    (v for v in _all_vms2
+                     if (v.get("name") or "").lower() == _vc_short2), None)
+            # Strategy B — guest IP match (for IP-addressed vCenter)
+            if not _vc_vm2 and _vc_own_ip2:
+                for _v2 in _all_vms2:
+                    _vid2 = _v2.get("vm", "")
+                    if not _vid2:
+                        continue
+                    _guest2 = vc_get(vc_url, token,
+                        f"/api/vcenter/vm/{_vid2}/guest/networking/interfaces") or []
+                    for _giface2 in (_guest2 if isinstance(_guest2, list) else []):
+                        for _gaddr2 in (_giface2.get("ip", {}) or {}).get("ip_addresses", []):
+                            if _gaddr2.get("ip_address") == _vc_own_ip2:
+                                _vc_vm2 = _v2
+                                break
+                        if _vc_vm2:
+                            break
+                    if _vc_vm2:
+                        break
+            if _vc_vm2:
+                _vm_id2 = _vc_vm2.get("vm", "")
+                _nics2  = vc_get(vc_url, token,
+                    f"/api/vcenter/vm/{_vm_id2}/hardware/ethernet") or [] if _vm_id2 else []
+                if _nics2:
+                    _nic0_2 = _nics2[0].get("nic", "")
+                    _nd2    = vc_get(vc_url, token,
+                        f"/api/vcenter/vm/{_vm_id2}/hardware/ethernet/{_nic0_2}") if _nic0_2 else {}
+                    _pg2    = ((_nd2 or {}).get("backing") or {}).get("network", "")
+                    if _pg2:
+                        result["suggested_pg_id"]     = _pg2
+                        result["suggested_pg_source"]  = "vCenter VM"
+        except Exception:
+            pass
 
         try:
             ifaces = vc_get(vc_url, token, "/api/appliance/networking/interfaces") or []
@@ -2893,6 +2948,41 @@ def fix_vna_options():
                         result["overlay_tz_path"] = preferred[0]["path"]
                     elif overlay_tzs:
                         result["overlay_tz_path"] = overlay_tzs[0]["path"]
+            except Exception:
+                pass
+
+        # ── Priorities 2 & 3: Edge VM / VNA VM port group (via NSX ETNs) ─────────
+        if not result["suggested_pg_id"] and nsx_url:
+            try:
+                _ep2 = ("/policy/api/v1/infra/sites/default"
+                        "/enforcement-points/default")
+                # Collect VNA ETN IDs
+                _vna_ids2: set = set()
+                _vna_cls2 = nsx_get(nsx_url, nsx_user, nsx_pass,
+                    f"{_ep2}/virtual-network-appliance-clusters")
+                for _vc3 in (_vna_cls2 or {}).get("results", []):
+                    for _m3 in _vc3.get("members", []):
+                        _eid3 = (_m3.get("edge_transport_node_path") or "").rstrip("/").split("/")[-1]
+                        if _eid3:
+                            _vna_ids2.add(_eid3)
+                # All ETNs
+                _all_etns3 = (nsx_get(nsx_url, nsx_user, nsx_pass,
+                    f"{_ep2}/edge-transport-nodes") or {}).get("results", [])
+                # Priority 2: first non-VNA ETN → Edge VM
+                _edge3 = next((e for e in _all_etns3 if e.get("id") not in _vna_ids2), None)
+                if _edge3:
+                    _pg3 = (_edge3.get("management_interface") or {}).get("network_id", "")
+                    if _pg3:
+                        result["suggested_pg_id"]    = _pg3
+                        result["suggested_pg_source"] = "Edge VM"
+                # Priority 3: first VNA ETN → VNA VM
+                if not result["suggested_pg_id"]:
+                    _vna3 = next((e for e in _all_etns3 if e.get("id") in _vna_ids2), None)
+                    if _vna3:
+                        _pg3 = (_vna3.get("management_interface") or {}).get("network_id", "")
+                        if _pg3:
+                            result["suggested_pg_id"]    = _pg3
+                            result["suggested_pg_source"] = "VNA VM"
             except Exception:
                 pass
 
