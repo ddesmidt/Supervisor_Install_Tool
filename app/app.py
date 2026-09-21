@@ -3015,6 +3015,8 @@ def fix_vna_options():
             import re as _re_ci
 
             _si_s, _si_ep, _si_hdr = _soap_session(vc_url, username, password)
+            # SOAPAction is required for DVS ContainerView in VCF 9.x
+            _si_hdr = {**_si_hdr, "SOAPAction": "urn:vim25/6.7"}
 
             # ── A. Host → cluster map ─────────────────────────────────────────
             # ContainerView(HostSystem) → RetrieveProperties(name, parent)

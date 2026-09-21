@@ -1616,7 +1616,7 @@
                   <p x-show="wizardOptions?.vc_defaults?.vc_pg_id && wizardConfig.port_group_id === wizardOptions.vc_defaults.vc_pg_id"
                      style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
                     <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
-                    Auto-discovered from vCenter VM
+                    Auto-selected from vCenter VM's Port Group
                   </p>
                   <p x-show="wizardOptions?.node_pg_id && wizardConfig.port_group_id === wizardOptions.node_pg_id && wizardConfig.port_group_id !== (wizardOptions?.vc_defaults?.vc_pg_id || '')"
                      style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
@@ -2066,14 +2066,14 @@
                 </template>
               </select>
             </div></div>
-            <!-- Auto-discovered hint -->
+            <!-- Auto-selected hint -->
             <p x-show="vnaWizard.options && vnaWizard.options.suggested_pg_id &&
                         vnaWizard.form.port_group_id === vnaWizard.options.suggested_pg_id"
                style="font-size:0.68rem; color:#48960c; margin:0.2rem 0 0 0;">
               <i class="fas fa-check-circle" style="margin-right:0.25rem;"></i>
-              Auto-discovered from <span x-text="vnaWizard.options && vnaWizard.options.suggested_pg_source"></span>
+              Auto-selected from <span x-text="vnaWizard.options && vnaWizard.options.suggested_pg_source"></span>'s Port Group
             </p>
-            <!-- Multi-VDS: prompt user to pick PG after cluster change -->
+            <!-- Multi-VDS: prompt user to pick PG after cluster change cleared it -->
             <p x-show="vnaWizard.options && !vnaWizard.options.all_same_vds &&
                         !vnaWizard.form.port_group_id"
                style="font-size:0.68rem; color:#e8a000; margin:0.2rem 0 0 0;">
@@ -4293,10 +4293,11 @@
 
       // ── VNA Fix Wizard ────────────────────────────────────────────────
       vnaWizard: {
-        show:    false,
-        step:    0,
-        loading: false,
-        options: null,
+        show:           false,
+        step:           0,
+        loading:        false,
+        options:        null,
+        pgClearWarning: false,
         form: {
           port_group_id: '',
           cluster_moref: '',
@@ -6161,10 +6162,13 @@
         if (opts.all_same_vds === false) {
           const clPGs = (opts.cluster_portgroups || {})[selCluster] || [];
           const curPG  = this.vnaWizard.form.port_group_id;
-          // Only filter if we have actual PG data for this cluster's VDS;
-          // if clPGs is empty (DVS lookup failed), keep the current selection.
+          // If we have real cluster-scoped PG data and the current PG is not in it, clear it.
+          // If clPGs is empty (DVS lookup fallback), keep the current selection unchanged.
           if (curPG && clPGs.length > 0 && !clPGs.some(pg => pg.network === curPG)) {
             this.vnaWizard.form.port_group_id = '';  // not on this cluster's VDS — clear
+            this.vnaWizard.pgClearWarning = true;
+          } else {
+            this.vnaWizard.pgClearWarning = false;
           }
         }
 
