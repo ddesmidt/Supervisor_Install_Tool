@@ -3006,40 +3006,181 @@ def fix_vna_options():
         # Build: per-cluster hosts, per-cluster PGs, per-cluster VDS,
         #        per-cluster datastores, all_same_vds flag,
         #        source_cluster, suggested_cluster.
+        #
+        # NOTE: The vCenter REST API filter.clusters parameter is NOT supported
+        #       in VCF 9.x / vCenter 9.x (returns HTTP 400 "Unsupported property").
+        #       We use SOAP ContainerView + RetrieveProperties instead, following
+        #       the same pattern as _vc_soap_find_dvs_by_name().
         try:
-            # 1. Hosts per cluster
-            #    {cluster_moref: {"names": [fqdn_lower], "ids": [host_moref]}}
-            _cl_hosts: dict  = {}   # {cmref: [host_fqdn_lower]}
-            _cl_hids:  dict  = {}   # {cmref: [host_moref]} — for placement.host lookup
-            for _cl in result.get("clusters", []):
-                _cmref = _cl.get("cluster", "")
-                if not _cmref:
-                    continue
-                _hlist = vc_get(vc_url, token, "/api/vcenter/host",
-                                params={"filter.clusters": _cmref}) or []
-                _cl_hosts[_cmref] = [(h.get("name") or "").lower()
-                                     for h in _hlist if h.get("name")]
-                _cl_hids[_cmref]  = [h.get("host", "") for h in _hlist]
+            import re as _re_ci
 
-            # 2. Per-cluster port groups (scoped to each cluster's VDS)
-            _cl_pgs: dict = {}
-            for _cmref in _cl_hosts:
-                _pgs = vc_get(vc_url, token, "/api/vcenter/network",
-                              params={"types": "DISTRIBUTED_PORTGROUP",
-                                      "filter.clusters": _cmref}) or []
-                _cl_pgs[_cmref] = _pgs
-            result["cluster_portgroups"] = _cl_pgs
+            _si_s, _si_ep, _si_hdr = _soap_session(vc_url, username, password)
 
-            # 3. Per-cluster datastores (sorted best-free-space first)
+            # ── A. Host → cluster map ─────────────────────────────────────────
+            # ContainerView(HostSystem) → RetrieveProperties(name, parent)
+            _host_cluster: dict = {}  # {host_moref: cluster_moref}
+            _host_name:    dict = {}  # {host_moref: hostname_lower}
+            _cl_hosts:     dict = {}  # {cluster_moref: [hostname_lower]}
+            _cl_hids:      dict = {}  # {cluster_moref: [host_moref]}
+
+            _r_cv_h = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
+                '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+                '<Body><CreateContainerView xmlns="urn:vim25">'
+                '<_this type="ViewManager">ViewManager</_this>'
+                '<container type="Folder">group-d1</container>'
+                '<type>HostSystem</type><recursive>true</recursive>'
+                '</CreateContainerView></Body></Envelope>'))
+            _cv_h_m = _re_ci.search(
+                r'<returnval type="ContainerView">([^<]+)</returnval>', _r_cv_h.text)
+            if _cv_h_m:
+                _cv_h = _cv_h_m.group(1).strip()
+                _r_h = _si_s.post(_si_ep, verify=False, timeout=30, headers=_si_hdr, data=(
+                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+                    '<Body><RetrieveProperties xmlns="urn:vim25">'
+                    '<_this type="PropertyCollector">propertyCollector</_this>'
+                    '<specSet>'
+                    '<propSet><type>HostSystem</type><all>false</all>'
+                    '<pathSet>name</pathSet><pathSet>parent</pathSet></propSet>'
+                    f'<objectSet><obj type="ContainerView">{_cv_h}</obj>'
+                    '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+                    ' xsi:type="TraversalSpec"><type>ContainerView</type>'
+                    '<path>view</path></selectSet>'
+                    '</objectSet></specSet>'
+                    '</RetrieveProperties></Body></Envelope>'))
+                for _rv_h in _re_ci.finditer(
+                        r'<returnval>(<obj type="HostSystem">[^<]+</obj>.*?)</returnval>',
+                        _r_h.text, _re_ci.DOTALL):
+                    _chunk_h = _rv_h.group(1)
+                    _hm = _re_ci.search(r'<obj type="HostSystem">([^<]+)</obj>', _chunk_h)
+                    _nm = _re_ci.search(
+                        r'<propSet><name>name</name><val[^>]*>([^<]+)</val></propSet>', _chunk_h)
+                    _pm = _re_ci.search(
+                        r'<propSet><name>parent</name>'
+                        r'<val[^>]*type="ClusterComputeResource"[^>]*>([^<]+)</val></propSet>',
+                        _chunk_h)
+                    if not _hm:
+                        continue
+                    _hid   = _hm.group(1).strip()
+                    _hname = _nm.group(1).strip().lower() if _nm else ""
+                    _cl_id = _pm.group(1).strip() if _pm else None
+                    _host_name[_hid] = _hname
+                    if _cl_id:
+                        _host_cluster[_hid] = _cl_id
+                        _cl_hids.setdefault(_cl_id, []).append(_hid)
+                        _cl_hosts.setdefault(_cl_id, []).append(_hname)
+
+            # ── B. VDS → portgroups map ───────────────────────────────────────
+            # ContainerView(VmwareDistributedVirtualSwitch or DistributedVirtualSwitch)
+            # → RetrieveProperties(name, portgroup)
+            _all_pgs     = result.get("port_groups", [])
+            _pg_by_moref = {p.get("network"): p for p in _all_pgs if p.get("network")}
+            _vds_pg_map: dict = {}  # {vds_name: [REST_dvpg_entries]}
+
+            def _dvs_cv_scan(_dvs_type):
+                """Try to build _vds_pg_map using the given DVS SOAP type name."""
+                _r = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
+                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+                    '<Body><CreateContainerView xmlns="urn:vim25">'
+                    '<_this type="ViewManager">ViewManager</_this>'
+                    '<container type="Folder">group-d1</container>'
+                    f'<type>{_dvs_type}</type><recursive>true</recursive>'
+                    '</CreateContainerView></Body></Envelope>'))
+                _cv_m = _re_ci.search(
+                    r'<returnval type="ContainerView">([^<]+)</returnval>', _r.text)
+                if not _cv_m:
+                    return False
+                _cv = _cv_m.group(1).strip()
+                _r2 = _si_s.post(_si_ep, verify=False, timeout=30, headers=_si_hdr, data=(
+                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+                    '<Body><RetrieveProperties xmlns="urn:vim25">'
+                    '<_this type="PropertyCollector">propertyCollector</_this>'
+                    '<specSet>'
+                    f'<propSet><type>{_dvs_type}</type><all>false</all>'
+                    '<pathSet>name</pathSet><pathSet>portgroup</pathSet></propSet>'
+                    f'<objectSet><obj type="ContainerView">{_cv}</obj>'
+                    '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+                    ' xsi:type="TraversalSpec"><type>ContainerView</type>'
+                    '<path>view</path></selectSet>'
+                    '</objectSet></specSet>'
+                    '</RetrieveProperties></Body></Envelope>'))
+                _found = False
+                for _rv in _re_ci.finditer(
+                        r'<returnval>(<obj type="[^"]*VirtualSwitch[^"]*">'
+                        r'[^<]+</obj>.*?)</returnval>',
+                        _r2.text, _re_ci.DOTALL):
+                    _chunk = _rv.group(1)
+                    _nm = _re_ci.search(
+                        r'<propSet><name>name</name><val[^>]*>([^<]+)</val></propSet>',
+                        _chunk)
+                    _pgm = _re_ci.search(
+                        r'<propSet><name>portgroup</name><val[^>]*>(.*?)</val></propSet>',
+                        _chunk, _re_ci.DOTALL)
+                    if not _nm:
+                        continue
+                    _vname = _nm.group(1).strip()
+                    _pg_morefs = _re_ci.findall(
+                        r'type="DistributedVirtualPortgroup"[^>]*>([^<]+)</ManagedObjectReference>',
+                        _pgm.group(1) if _pgm else "")
+                    _vds_pg_map[_vname] = [
+                        _pg_by_moref[m] for m in _pg_morefs if m in _pg_by_moref]
+                    _found = True
+                return _found
+
+            if not _dvs_cv_scan("VmwareDistributedVirtualSwitch"):
+                _dvs_cv_scan("DistributedVirtualSwitch")
+
+            # ── C. Cluster → datastores ───────────────────────────────────────
+            # ContainerView(ClusterComputeResource) → RetrieveProperties(datastore)
+            _all_ds      = result.get("datastores", [])
+            _ds_by_moref = {d.get("datastore"): d for d in _all_ds if d.get("datastore")}
             _cl_ds: dict = {}
-            for _cmref in _cl_hosts:
-                _dsr = vc_get(vc_url, token, "/api/vcenter/datastore",
-                              params={"filter.clusters": _cmref}) or []
-                _cl_ds[_cmref] = sorted(_dsr,
-                    key=lambda d: d.get("free_space", 0), reverse=True)
+
+            _r_cv_c = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
+                '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+                '<Body><CreateContainerView xmlns="urn:vim25">'
+                '<_this type="ViewManager">ViewManager</_this>'
+                '<container type="Folder">group-d1</container>'
+                '<type>ClusterComputeResource</type><recursive>true</recursive>'
+                '</CreateContainerView></Body></Envelope>'))
+            _cv_c_m = _re_ci.search(
+                r'<returnval type="ContainerView">([^<]+)</returnval>', _r_cv_c.text)
+            if _cv_c_m:
+                _cv_c = _cv_c_m.group(1).strip()
+                _r_c = _si_s.post(_si_ep, verify=False, timeout=30, headers=_si_hdr, data=(
+                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+                    '<Body><RetrieveProperties xmlns="urn:vim25">'
+                    '<_this type="PropertyCollector">propertyCollector</_this>'
+                    '<specSet>'
+                    '<propSet><type>ClusterComputeResource</type><all>false</all>'
+                    '<pathSet>datastore</pathSet></propSet>'
+                    f'<objectSet><obj type="ContainerView">{_cv_c}</obj>'
+                    '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+                    ' xsi:type="TraversalSpec"><type>ContainerView</type>'
+                    '<path>view</path></selectSet>'
+                    '</objectSet></specSet>'
+                    '</RetrieveProperties></Body></Envelope>'))
+                for _rv_c in _re_ci.finditer(
+                        r'<returnval>(<obj type="ClusterComputeResource">'
+                        r'[^<]+</obj>.*?)</returnval>',
+                        _r_c.text, _re_ci.DOTALL):
+                    _chunk_c = _rv_c.group(1)
+                    _cm = _re_ci.search(
+                        r'<obj type="ClusterComputeResource">([^<]+)</obj>', _chunk_c)
+                    _dm = _re_ci.search(
+                        r'<propSet><name>datastore</name><val[^>]*>(.*?)</val></propSet>',
+                        _chunk_c, _re_ci.DOTALL)
+                    if not _cm:
+                        continue
+                    _cl_id_c  = _cm.group(1).strip()
+                    _ds_morefs = _re_ci.findall(
+                        r'type="Datastore"[^>]*>([^<]+)</ManagedObjectReference>',
+                        _dm.group(1) if _dm else "")
+                    _cl_ds[_cl_id_c] = sorted(
+                        [_ds_by_moref[m] for m in _ds_morefs if m in _ds_by_moref],
+                        key=lambda d: d.get("free_space", 0), reverse=True)
             result["cluster_datastores"] = _cl_ds
 
-            # 4. VDS per cluster (via NSX HTN host_switch_name)
+            # ── D. VDS per cluster (NSX HTN + host→cluster map) ──────────────
             _cl_vds: dict = {}
             if nsx_url:
                 _ep_ht2 = ("/policy/api/v1/infra/sites/default/enforcement-points"
@@ -3063,34 +3204,44 @@ def fix_vna_options():
                             break
             result["cluster_vds_map"] = _cl_vds
 
-            # 5. Are all clusters on the same VDS?
+            # ── E. Per-cluster port groups (from VDS PG map) ─────────────────
+            _cl_pgs: dict = {}
+            for _cmref, _vds_name in _cl_vds.items():
+                _cl_pgs[_cmref] = _vds_pg_map.get(_vds_name, [])
+            # Graceful fallback: if VDS PG map is unavailable (all clusters have
+            # empty PG lists), assign all port groups to all clusters.
+            if _all_pgs and not any(_cl_pgs.values()):
+                for _cl_item in result.get("clusters", []):
+                    _cl_pgs[_cl_item.get("cluster", "")] = _all_pgs
+            result["cluster_portgroups"] = _cl_pgs
+
+            # ── F. Are all clusters on the same VDS? ──────────────────────────
             _uniq_vds = set(_cl_vds.values())
             _all_same = len(_uniq_vds) <= 1
             result["all_same_vds"] = _all_same
 
-            # 6. Source cluster (where the pre-selected VM lives)
-            # NOTE: GET /api/vcenter/vm/{id} does NOT return placement in its
-            # response (placement is a write-only spec). We instead iterate
-            # over clusters and ask "which one contains this VM moref?"
+            # ── G. Source cluster (where the pre-selected VM lives) ───────────
+            # Use SOAP RetrieveProperties(runtime.host) on the VM, then map
+            # host → cluster via the _host_cluster dict built in step A.
             _src_cluster = None
             _pg_src = result.get("suggested_pg_source", "")
 
             if _pg_src == "vCenter VM" and _src_vm_id:
-                # Strategy A: GET /api/vcenter/vm?filter.clusters={c} per cluster
-                # — returns only VMs hosted in that cluster, reliable & fast.
-                try:
-                    for _cmref_a in list(_cl_hosts.keys()):
-                        _vms_a = vc_get(vc_url, token, "/api/vcenter/vm",
-                                        params={"filter.clusters": _cmref_a}) or []
-                        if any(v.get("vm") == _src_vm_id for v in _vms_a):
-                            _src_cluster = _cmref_a
-                            break
-                except Exception:
-                    pass
+                _r_vm_h = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
+                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+                    '<Body><RetrieveProperties xmlns="urn:vim25">'
+                    '<_this type="PropertyCollector">propertyCollector</_this>'
+                    '<specSet>'
+                    '<propSet><type>VirtualMachine</type><all>false</all>'
+                    '<pathSet>runtime.host</pathSet></propSet>'
+                    f'<objectSet><obj type="VirtualMachine">{_src_vm_id}</obj>'
+                    '</objectSet></specSet>'
+                    '</RetrieveProperties></Body></Envelope>'))
+                _vm_hm = _re_ci.search(r'type="HostSystem"[^>]*>([^<]+)<', _r_vm_h.text)
+                if _vm_hm:
+                    _src_cluster = _host_cluster.get(_vm_hm.group(1).strip())
 
-                # Strategy B (fallback): find the unique cluster whose PG list
-                # exclusively contains the suggested PG (only works when the PG
-                # is truly absent from other clusters' VDSes).
+                # Fallback: PG uniquely identifies one cluster's VDS
                 if not _src_cluster and result.get("suggested_pg_id"):
                     _spg = result["suggested_pg_id"]
                     _hits = [c for c, pgs in _cl_pgs.items()
@@ -3099,7 +3250,6 @@ def fix_vna_options():
                         _src_cluster = _hits[0]
 
             elif _pg_src in ("Edge VM", "VNA VM") and _src_etn_name:
-                # Match ETN hostname (may be short or FQDN) against cluster hosts
                 for _cmref_e, _hnames_e in _cl_hosts.items():
                     if any(_src_etn_name == _hn or
                            _src_etn_name.startswith(_hn.split(".")[0]) or
@@ -3107,22 +3257,10 @@ def fix_vna_options():
                            for _hn in _hnames_e):
                         _src_cluster = _cmref_e
                         break
-                # Fallback via VM filter for the ETN's host (if hostname didn't match)
-                if not _src_cluster and _src_etn_name:
-                    try:
-                        for _cmref_e in list(_cl_hosts.keys()):
-                            _hosts_e = vc_get(vc_url, token, "/api/vcenter/host",
-                                              params={"filter.clusters": _cmref_e}) or []
-                            if any(_src_etn_name in (h.get("name") or "").lower() or
-                                   (h.get("name") or "").lower() in _src_etn_name
-                                   for h in _hosts_e):
-                                _src_cluster = _cmref_e
-                                break
-                    except Exception:
-                        pass
+
             result["source_cluster_moref"] = _src_cluster
 
-            # 7. Suggested cluster
+            # ── H. Suggested cluster ──────────────────────────────────────────
             _sugg_cl  = None
             _sugg_why = None
             if _all_same:
@@ -3132,13 +3270,12 @@ def fix_vna_options():
                     _sugg_cl  = _best[0]
                     _sugg_why = "most hosts"
             else:
-                # Dedicated VDSes → MUST use the source VM's cluster
+                # Dedicated VDSes → must use the source VM's cluster
                 if _src_cluster:
                     _sugg_cl  = _src_cluster
                     _sugg_why = f"{_pg_src}'s cluster"
                 else:
-                    # Last resort: pick the cluster whose PG list uniquely
-                    # contains the suggested PG (same as Strategy B above)
+                    # Last resort: PG uniquely identifies cluster
                     if result.get("suggested_pg_id"):
                         _spg = result["suggested_pg_id"]
                         _hits2 = [c for c, pgs in _cl_pgs.items()

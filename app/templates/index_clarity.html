@@ -6161,7 +6161,9 @@
         if (opts.all_same_vds === false) {
           const clPGs = (opts.cluster_portgroups || {})[selCluster] || [];
           const curPG  = this.vnaWizard.form.port_group_id;
-          if (curPG && !clPGs.some(pg => pg.network === curPG)) {
+          // Only filter if we have actual PG data for this cluster's VDS;
+          // if clPGs is empty (DVS lookup failed), keep the current selection.
+          if (curPG && clPGs.length > 0 && !clPGs.some(pg => pg.network === curPG)) {
             this.vnaWizard.form.port_group_id = '';  // not on this cluster's VDS — clear
           }
         }
