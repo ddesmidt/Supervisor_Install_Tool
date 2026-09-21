@@ -4741,18 +4741,32 @@ def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, 
         except Exception: pass
 
 
-def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns):
-    """PowerCLI: removes vmks on all hosts + DVPortGroup (best-effort)."""
+def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns,
+                             vds_name=None):
+    """PowerCLI: removes vmks on all hosts + DVPortGroup (best-effort).
+
+    vds_name: when provided, limits PG lookup to that specific VDS (required
+              when multiple clusters share the same PG name on different VDSes).
+    """
     import subprocess, tempfile, os, textwrap
-    vc_host = vc_url.replace("https://", "").replace("http://", "").rstrip("/")
+    vc_host    = vc_url.replace("https://", "").replace("http://", "").rstrip("/")
     host_array = ", ".join(f"\'{h}\'" for h in host_fqdns)
+    # Build the PowerShell expression that finds the port group.
+    # With a VDS name we scope to that switch; without it we fall back to
+    # searching all VDSes (backward-compatible behaviour).
+    if vds_name:
+        pg_lookup = textwrap.dedent(f"""\
+            $vds = Get-VDSwitch -Name '{vds_name}' -ErrorAction SilentlyContinue
+            $pg  = if ($vds) {{ Get-VDPortgroup -VDSwitch $vds -Name '{pg_name}' -ErrorAction SilentlyContinue }} else {{ $null }}""")
+    else:
+        pg_lookup = f"$pg = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue"
     script = textwrap.dedent(f"""\
         $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $ErrorActionPreference = 'SilentlyContinue'
         Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
         Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
         Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
-        $pg = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue
+        {pg_lookup}
         if ($pg) {{
             foreach ($fqdn in @({host_array})) {{
                 try {{
@@ -5825,19 +5839,29 @@ def check_vlan():
             result["error"] = "No External IP Block matching the DVLAN subnet — complete R5-3 first."
             return jsonify(result)
 
-        # ── 3. Prepared ESX hosts + NSX VDS name ───────────────────────────
+        # ── 3. Prepared ESX hosts + per-host VDS map ───────────────────────
+        # Each cluster may use its own dedicated VDS (common in multi-cluster VCF).
+        # We read the VDS name per host from NSX HTN host_switch_spec so that
+        # the port group is created on the correct VDS for every host.
         htns = (nsx_get(nsx_url, nsx_user, nsx_pass,
             "/policy/api/v1/infra/sites/default/enforcement-points"
             "/default/host-transport-nodes") or {}).get("results", [])
-        nsx_vds_name = ""
+        nsx_vds_name = ""           # fallback / first VDS seen
+        per_host_vds: dict = {}     # {fqdn: vds_name}
         for h in htns:
             fqdn = (h.get("node_deployment_info") or {}).get("fqdn") or h.get("display_name", "")
             if not fqdn: continue
             hosts.append(fqdn)
-            if not nsx_vds_name:
-                for hs in (h.get("host_switch_spec") or {}).get("host_switches") or []:
-                    nsx_vds_name = hs.get("host_switch_name", "")
-                    if nsx_vds_name: break
+            for hs in (h.get("host_switch_spec") or {}).get("host_switches") or []:
+                vn = hs.get("host_switch_name", "")
+                if vn:
+                    per_host_vds[fqdn] = vn
+                    if not nsx_vds_name:
+                        nsx_vds_name = vn
+                    break
+        # Fill in fallback VDS for any host without an explicit entry
+        for fqdn in hosts:
+            per_host_vds.setdefault(fqdn, nsx_vds_name)
         if not hosts:
             result["error"] = "No prepared ESX hosts found — complete S3 (NSX Host Preparation) first."
             return jsonify(result)
@@ -5889,9 +5913,10 @@ def check_vlan():
         # We create only host-0's vmknic first so the IP scan runs before
         # the other hosts' temp IPs exist on the VLAN — any response is a
         # real server, not our own vmknic.
-        pg_name = f"vcf-vlan-check-{vlan_id}"
+        pg_name   = f"vcf-vlan-check-{vlan_id}"
+        host0_vds = per_host_vds.get(hosts[0], nsx_vds_name)
         vmk_map, _pg_created, setup_err, vmk_errors = _pcli_setup_vlan_test(
-            vc_url, vc_user, vc_pass, nsx_vds_name, pg_name, vlan_id,
+            vc_url, vc_user, vc_pass, host0_vds, pg_name, vlan_id,
             [(hosts[0], temp_ips[0], mask_str)])
         if setup_err:
             result["error"] = f"PowerCLI setup failed: {setup_err}"
@@ -6037,13 +6062,23 @@ def check_vlan():
                 # Keep SSH enabled — the main gateway-ping loop needs it for host-0
 
         # ── 5c. Phase 2: vmknics for hosts 1-N ────────────────────────────
+        # Group remaining hosts by their VDS — each VDS needs its own call
+        # so the port group is created/reused on the correct switch.
         if len(hosts) > 1:
-            _ph2_arg = [(hosts[i], temp_ips[i], mask_str) for i in range(1, len(hosts))]
-            _vmk2, _, _err2, _verr2 = _pcli_setup_vlan_test(
-                vc_url, vc_user, vc_pass, nsx_vds_name, pg_name, vlan_id,
-                _ph2_arg, pg_already_exists=True)
-            if not _err2:
-                vmk_map.update(_vmk2)
+            from collections import defaultdict as _ddict
+            _rest_by_vds: dict = _ddict(list)
+            for _i2 in range(1, len(hosts)):
+                _f2  = hosts[_i2]
+                _vn2 = per_host_vds.get(_f2, nsx_vds_name)
+                _rest_by_vds[_vn2].append((_f2, temp_ips[_i2], mask_str))
+            for _vds2, _group2 in _rest_by_vds.items():
+                # PG already exists on host-0's VDS; create a fresh PG on any other VDS
+                _pg_exists2 = (_vds2 == host0_vds)
+                _vmk2, _, _err2, _verr2 = _pcli_setup_vlan_test(
+                    vc_url, vc_user, vc_pass, _vds2, pg_name, vlan_id,
+                    _group2, pg_already_exists=_pg_exists2)
+                if not _err2:
+                    vmk_map.update(_vmk2)
                 vmk_errors.update(_verr2)
 
         # ── 6. Per-host: SSH → gateway ping ───────────────────────────────
@@ -6057,8 +6092,9 @@ def check_vlan():
                 "conflict": _prescan_conflict if idx == 0 else None
             }
             result["tests"].append(test)
+            _host_vds = per_host_vds.get(fqdn, nsx_vds_name)
             steps = (list(_prescan_steps) if idx == 0 else []) + [
-                f"✓ VDS='{nsx_vds_name}', PG='{pg_name}' (VLAN {vlan_id})",
+                f"✓ VDS='{_host_vds}', PG='{pg_name}' (VLAN {vlan_id})",
                 f"✓ Temp IP={temp_ip}/{prefix_len}, Gateway={gateway_ip}"
             ]
             ssh_state = None
@@ -6225,8 +6261,22 @@ def check_vlan():
         result["error"] = traceback.format_exc()
     finally:
         if pg_name and hosts:
-            try: _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, hosts)
-            except Exception: pass
+            # Clean up the temp PG on every VDS that was used.
+            # When per_host_vds is available we call cleanup once per distinct VDS
+            # so the scoped Get-VDPortgroup lookup works correctly.
+            try:
+                _vds_cleanup_map: dict = {}  # {vds_name: [fqdns]}
+                for _cf in hosts:
+                    _cv = per_host_vds.get(_cf, nsx_vds_name) if per_host_vds else nsx_vds_name
+                    _vds_cleanup_map.setdefault(_cv, []).append(_cf)
+                if _vds_cleanup_map:
+                    for _cv, _cf_list in _vds_cleanup_map.items():
+                        _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass,
+                                                pg_name, _cf_list, vds_name=_cv)
+                else:
+                    _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, hosts)
+            except Exception:
+                pass
 
     return jsonify(result)
 
