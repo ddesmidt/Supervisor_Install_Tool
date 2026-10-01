@@ -75,6 +75,15 @@ Each card shows:
 - A **"View Requirement Steps"** radio button in the footer — click it to expand the full-width steps panel for that mode
 - A **Deploy** button (enabled only when all steps are green)
 
+### Cluster Scope Filter
+
+When the vCenter manages **two or more clusters**, a filter control appears above the mode cards. It lets you scope the requirements check to a specific subset of clusters instead of checking all of them at once:
+
+- **All clusters** (default) — runs the check across every cluster found
+- **Individual clusters** — tick one or more cluster checkboxes; only the selected clusters are evaluated and shown in the steps panel
+
+The filter is also linked to the **Deploy Supervisor** wizard: if you have a cluster selected in the filter, the Deploy wizard pre-selects that cluster (or its zone) automatically, and disables zones whose clusters are not in the current filter.
+
 ### The full-width steps panel
 
 Clicking **"View Requirement Steps"** on a card shows all requirement steps for that mode in a full-width panel below the cards. Only one mode's steps are visible at a time. The panel header contains a **"Re-check Requirements"** button to refresh all checks at any time. Each step shows:
@@ -159,15 +168,13 @@ The following steps have automated Fix wizards:
 
 When you click **Fix** on R4 Distributed, a 3-step wizard opens:
 
-1. **Node IPs** — The wizard auto-discovers recommended values for the three key fields:
+1. **Node IPs** — The wizard auto-discovers recommended values:
 
    | Field | Auto-selection logic |
    |---|---|
-   | **vSphere Cluster** | The cluster that hosts the vCenter VM (priority 1), or the Edge VM's cluster, or the VNA VM's cluster. In a single-VDS environment the cluster with the most hosts is suggested instead. |
-   | **Port Group** | The port group of the vCenter VM's first vNIC (priority 1), or the Edge VM's management port group, or the VNA VM's management port group. Shown with a green *"Auto-selected from vCenter VM's Port Group"* note. |
-   | **Datastore** | The datastore with the most free space on the selected cluster. |
-
-   In environments with **multiple clusters and dedicated VDSes per cluster**, the Port Group dropdown is automatically scoped to only the port groups that belong to the selected cluster's VDS. Switching the cluster clears the port group selection if it no longer belongs to the new cluster's VDS, and an orange prompt reminds you to re-select.
+   | **Port Group** | The port group of the vCenter VM's first vNIC. Shown with a green note when auto-detected. |
+   | **vSphere Cluster** | Dropdown of all available clusters; select the cluster where VNA nodes should be deployed. |
+   | **Datastore** | List of datastores sorted by free space (largest first). |
 
    Enter the two management IPs (one per VNA node).
 
@@ -207,7 +214,8 @@ A 5-step wizard opens:
 
 Select the vSphere Zone (or compute cluster) to enable Supervisor on.
 
-- **Zone(s) configured**: a **Zone-based selector** is shown — choose the vSphere Zone that contains your target cluster.
+- **Zone(s) configured**: a **Zone-based selector** is shown — choose the vSphere Zone that contains your target cluster. If a **Cluster Scope Filter** is active (Step 3), zones whose clusters are all outside the filter are shown as greyed-out and cannot be selected. Zones with at least one cluster in the filter remain selectable.
+- **Clusters not in any zone**: if the vCenter has clusters that have not been assigned to a vSphere Zone, they appear in a separate **"Clusters not in a zone"** section below the zone list and can be selected directly.
 - **No Zone configured**: a **cluster selector** is shown — choose the cluster directly. If only one cluster exists it is pre-selected.
 
 ### Wizard Step 2 — Network

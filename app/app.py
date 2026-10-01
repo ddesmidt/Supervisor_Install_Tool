@@ -376,6 +376,28 @@ def check_requirements():
         except Exception as e:
             d["vc_clusters"] = []; d["clusters_error"] = str(e)
 
+        # Build host_short/fqdn → cluster_name using vCenter (reliable; used for
+        # R3 grouping and cluster-filter logic in the requirements checks).
+        try:
+            _vc_host_cluster: dict = {}
+            for _c in d.get("vc_clusters", []):
+                _moref = _c.get("cluster", "")
+                _cname = _c.get("name", "")
+                if not _moref or not _cname:
+                    continue
+                _raw = vc_get(vc_url, d["token"],
+                              "/api/vcenter/host",
+                              params={"clusters": _moref}) or []
+                for _h in _raw:
+                    _hname = _h.get("name", "")
+                    if _hname:
+                        _short = _hname.split(".")[0] if "." in _hname else _hname
+                        _vc_host_cluster[_hname] = _cname
+                        _vc_host_cluster[_short]  = _cname
+            d["vc_host_cluster_map"] = _vc_host_cluster
+        except Exception:
+            d["vc_host_cluster_map"] = {}
+
     if nsx_url:
         try:
             tnc = nsx_get(nsx_url, nsx_user, nsx_pass,
@@ -414,14 +436,31 @@ def check_requirements():
             tnc_v1_list = (tnc_v1_resp or {}).get("results", [])
 
             tnc_cluster_map: dict = {}
+            cc_id_to_cluster: dict = {}   # compute_collection_id → cluster_name
             for t in tnc_v1_list:
                 tid   = t.get("id", "")
                 cc_id = t.get("compute_collection_id", "")
                 cname = cc_names.get(cc_id, "")
                 if cname:
-                    tnc_cluster_map[tid] = cname
+                    tnc_cluster_map[tid]        = cname
+                    cc_id_to_cluster[cc_id]     = cname
 
             d["tnc_cluster_map"] = tnc_cluster_map
+
+            # Build host_short → cluster_name map by fetching compute-collection members
+            host_cluster_map: dict = {}
+            for _cc_id, _cname in cc_id_to_cluster.items():
+                try:
+                    _mbr = nsx_get(nsx_url, nsx_user, nsx_pass,
+                                   f"/api/v1/fabric/compute-collections/{_cc_id}/member-status")
+                    for _m in (_mbr or {}).get("member_status", []):
+                        _fqdn  = _m.get("display_name", "")
+                        _short = _fqdn.split(".")[0] if "." in _fqdn else _fqdn
+                        if _short:
+                            host_cluster_map[_short] = _cname
+                except Exception:
+                    pass
+            d["host_cluster_map"] = host_cluster_map
         except Exception:
             d["tnc_cluster_map"] = {}
 
@@ -566,6 +605,18 @@ def check_requirements():
 
     # ── Phase 2: build per-mode check lists ──────────────────────────────────
 
+    # Optional cluster filter: list of morefs from the request body.
+    # Empty list (default) = check all clusters.
+    _cluster_filter = body.get("cluster_filter") or []
+    _filter_set     = set(_cluster_filter)
+
+    def _filtered_clusters():
+        """Return vc_clusters filtered to the selection (or all if no filter)."""
+        all_c = d.get("vc_clusters", [])
+        if not _filter_set:
+            return all_c
+        return [c for c in all_c if c.get("cluster") in _filter_set]
+
     def build_checks(mode: str) -> list:
         checks: list = []
 
@@ -602,7 +653,7 @@ def check_requirements():
         if "clusters_error" in d:
             add("2", "vSphere HA / DRS", "warning", f"Could not check: {d['clusters_error']}")
         else:
-            vc_clusters = d.get("vc_clusters", [])
+            vc_clusters = _filtered_clusters()
             cluster_issues, cluster_ok, clusters_to_fix = [], [], []
             cluster_details = []
             for c in vc_clusters:
@@ -662,43 +713,84 @@ def check_requirements():
             if "tep_error" in d:
                 add("3", "NSX Host Preparation", "warning", f"Could not check: {d['tep_error']}")
             elif d.get("tnc") or d.get("htn"):
-                tncs            = d.get("tnc", [])
-                htns            = d.get("htn", [])
-                htn_states      = d.get("htn_states", {})
-                tnc_cluster_map = d.get("tnc_cluster_map", {})
+                tncs             = d.get("tnc", [])
+                htn_states       = d.get("htn_states", {})
+                tnc_cluster_map  = d.get("tnc_cluster_map", {})
+                # Prefer the vCenter-derived map (reliable); fall back to NSX map
+                host_cluster_map = (d.get("vc_host_cluster_map") or
+                                    d.get("host_cluster_map", {}))
 
+                # Build moref → cluster_name lookup once
+                _moref_to_name = {c.get("cluster",""): c.get("name","")
+                                  for c in d.get("vc_clusters", [])}
+
+                def _host_cname(h):
+                    fn    = h.get("display_name", "")
+                    short = fn.split(".")[0] if "." in fn else fn
+                    return host_cluster_map.get(fn, "") or host_cluster_map.get(short, "")
+
+                # Apply cluster filter to host list
+                _all_htns = d.get("htn", [])
+                if _filter_set:
+                    _selected_cnames = {_moref_to_name[m] for m in _filter_set
+                                        if m in _moref_to_name and _moref_to_name[m]}
+                    if _selected_cnames:
+                        htns = [h for h in _all_htns
+                                if _host_cname(h) in _selected_cnames]
+                    else:
+                        htns = _all_htns   # map not built yet — show all
+                else:
+                    htns = _all_htns
+
+                # Cluster names for subtitle — filtered to selected clusters when filter active
                 cluster_names = []
                 for t in tncs:
                     tid   = t.get("id", "")
                     cname = tnc_cluster_map.get(tid) or t.get("display_name") or tid
+                    if _filter_set:
+                        # Only include if this TNC's cluster is in the selected set
+                        _moref_to_name = {c.get("cluster",""): c.get("name","")
+                                          for c in d.get("vc_clusters", [])}
+                        _sel_names = {_moref_to_name.get(m,"") for m in _filter_set}
+                        if cname not in _sel_names:
+                            continue
                     cluster_names.append(cname)
                 if not cluster_names:
                     cluster_names = ["(unknown)"]
 
-                # Per-host state lines
-                detail_lines = []
-                fail_count   = 0
+                # Build per-host status lines, grouped by cluster
+                from collections import defaultdict as _ddict
+                _grouped   = _ddict(list)   # cluster_name → [status_line, ...]
+                fail_count = 0
                 for h in htns:
                     hid   = h.get("id", "")
                     hname = h.get("display_name", hid)
                     short = hname.split(".")[0] if "." in hname else hname
+                    cname = host_cluster_map.get(short, "")
                     st    = htn_states.get(hid, {})
                     if st:
                         dstate  = (st.get("node_deployment_state") or {}).get("state", "unknown")
                         overall = st.get("state", dstate)
                         if overall == "success":
-                            detail_lines.append(f"· {short}: SUCCESS")
+                            _grouped[cname].append(f"  · {short}: SUCCESS")
                         else:
                             state_label = dstate.upper()
                             fail_msg    = (st.get("failure_message") or "").split(".")[0]
-                            if fail_msg:
-                                detail_lines.append(f"· {short}: {state_label} — {fail_msg}")
-                            else:
-                                detail_lines.append(f"· {short}: {state_label}")
+                            line = (f"  · {short}: {state_label} — {fail_msg}"
+                                    if fail_msg else f"  · {short}: {state_label}")
+                            _grouped[cname].append(line)
                             fail_count += 1
                     else:
-                        # No state data (e.g. state fetch failed) — assume ok
-                        detail_lines.append(f"· {short}: SUCCESS")
+                        _grouped[cname].append(f"  · {short}: SUCCESS")
+
+                # Flatten into detail_lines with cluster headers
+                detail_lines = []
+                for _cname in sorted(_grouped.keys(), key=lambda x: (x == "", x.lower())):
+                    if _cname:
+                        detail_lines.append(f"── {_cname} ──")
+                    else:
+                        detail_lines.append("── (cluster unknown) ──")
+                    detail_lines.extend(sorted(_grouped[_cname]))
 
                 total = len(htns)
                 if fail_count == 0:
@@ -1185,7 +1277,12 @@ def check_requirements():
             "distributed": build_checks("distributed"),
             "centralized":  build_checks("centralized"),
             "vds_flb":      build_checks("vds_flb"),
-        }
+        },
+        "clusters": sorted(
+            [{"cluster": c.get("cluster",""), "name": c.get("name", c.get("cluster",""))}
+             for c in d.get("vc_clusters", [])],
+            key=lambda c: c["name"].lower()
+        ),
     })
 
 
@@ -1278,9 +1375,23 @@ def discover_install_options():
                         "ha_enabled":  _cd.get("ha_enabled"),
                         "drs_enabled": _cd.get("drs_enabled"),
                     })
+                _zone_clusters.sort(key=lambda _c: _c.get("name", "").lower())
                 _zones_out.append({"zone": _zid, "name": _zname, "clusters": _zone_clusters})
 
             result["zones"] = _zones_out
+
+            # Clusters NOT assigned to any zone (shown separately so user can still
+            # select them — vCenter will create a new zone automatically on deploy).
+            _morefs_in_zones = {
+                _c.get("cluster")
+                for _z in _zones_out
+                for _c in _z.get("clusters", [])
+            }
+            result["clusters_not_in_zone"] = sorted(
+                [_rc for _rc in _raw_clusters
+                 if _rc.get("cluster") not in _morefs_in_zones],
+                key=lambda _rc: (_rc.get("name") or "").lower()
+            )
         except Exception as _ze:
             result["zones"] = []
             result["zones_debug"] = str(_ze)
@@ -2747,23 +2858,9 @@ def fix_vna_options():
         # auto-discovered NSX fields
         "overlay_tz_path": None,
         "vm_mgmt_dvpg":    None,
-        # suggested port group (priority: vCenter VM > Edge VM > VNA VM)
-        "suggested_pg_id":     None,
-        "suggested_pg_source": None,
-        # cluster intelligence
-        "suggested_cluster_moref":   None,
-        "suggested_cluster_source":  None,
-        "cluster_vds_map":           {},   # {cluster_moref: vds_name}
-        "cluster_portgroups":        {},   # {cluster_moref: [pg_list]}
-        "cluster_datastores":        {},   # {cluster_moref: [ds_list sorted by free space]}
-        "all_same_vds":              True,
-        "source_cluster_moref":      None,
     }
     try:
         token, _ = vc_auth(vc_url, username, password)
-        # Will be set by the priority blocks for cluster lookup later
-        _src_vm_id    = None   # vCenter VM moref (Priority 1)
-        _src_etn_name = None   # ETN display_name/hostname (Priority 2 or 3)
 
         result["port_groups"] = vc_get(
             vc_url, token, "/api/vcenter/network",
@@ -2773,59 +2870,7 @@ def fix_vna_options():
         result["datastores"] = sorted(ds_raw,
                                       key=lambda d: d.get("free_space", 0), reverse=True)
 
-        # ── Priority 1: vCenter VM port group ────────────────────────────────────
-        try:
-            from urllib.parse import urlparse as _ulp
-            _url_host2 = (_ulp(vc_url).hostname or "")
-            _url_is_ip2 = False
-            try:
-                import ipaddress as _ipa2
-                _ipa2.ip_address(_url_host2)
-                _url_is_ip2 = True
-            except ValueError:
-                pass
-            _vc_short2  = "" if _url_is_ip2 else _url_host2.split(".")[0].lower()
-            _vc_own_ip2 = _url_host2 if _url_is_ip2 else None
-            _all_vms2   = vc_get(vc_url, token, "/api/vcenter/vm") or []
-            _vc_vm2     = None
-            # Strategy A — name match
-            if _vc_short2:
-                _vc_vm2 = next(
-                    (v for v in _all_vms2
-                     if (v.get("name") or "").lower() == _vc_short2), None)
-            # Strategy B — guest IP match (for IP-addressed vCenter)
-            if not _vc_vm2 and _vc_own_ip2:
-                for _v2 in _all_vms2:
-                    _vid2 = _v2.get("vm", "")
-                    if not _vid2:
-                        continue
-                    _guest2 = vc_get(vc_url, token,
-                        f"/api/vcenter/vm/{_vid2}/guest/networking/interfaces") or []
-                    for _giface2 in (_guest2 if isinstance(_guest2, list) else []):
-                        for _gaddr2 in (_giface2.get("ip", {}) or {}).get("ip_addresses", []):
-                            if _gaddr2.get("ip_address") == _vc_own_ip2:
-                                _vc_vm2 = _v2
-                                break
-                        if _vc_vm2:
-                            break
-                    if _vc_vm2:
-                        break
-            if _vc_vm2:
-                _vm_id2 = _vc_vm2.get("vm", "")
-                _nics2  = vc_get(vc_url, token,
-                    f"/api/vcenter/vm/{_vm_id2}/hardware/ethernet") or [] if _vm_id2 else []
-                if _nics2:
-                    _nic0_2 = _nics2[0].get("nic", "")
-                    _nd2    = vc_get(vc_url, token,
-                        f"/api/vcenter/vm/{_vm_id2}/hardware/ethernet/{_nic0_2}") if _nic0_2 else {}
-                    _pg2    = ((_nd2 or {}).get("backing") or {}).get("network", "")
-                    if _pg2:
-                        result["suggested_pg_id"]     = _pg2
-                        result["suggested_pg_source"]  = "vCenter VM"
-                        _src_vm_id = _vm_id2   # save for cluster lookup
-        except Exception:
-            pass
-
+        _vc_own_ip = ""   # stored for VM-lookup fallback below
         try:
             ifaces = vc_get(vc_url, token, "/api/appliance/networking/interfaces") or []
             for iface in (ifaces if isinstance(ifaces, list) else []):
@@ -2834,6 +2879,7 @@ def fix_vna_options():
                 prefix = ipv4.get("prefix", 24)
                 gw     = ipv4.get("default_gateway", "")
                 if vc_ip and gw:
+                    _vc_own_ip = vc_ip
                     # Compute proper network address (e.g. 10.1.1.0/24, not 10.1.1.10/24)
                     try:
                         import ipaddress
@@ -2844,6 +2890,57 @@ def fix_vna_options():
                     result["vc_gateway"] = gw
                     result["vc_prefix"]  = prefix
                     break
+        except Exception:
+            pass
+
+        # Find vCenter VM's management port group via name/IP match.
+        # This is more reliable than the NSX TNC-tag approach which only
+        # exists in VCF-automated environments.
+        try:
+            _p = urlparse(vc_url)
+            _vc_host  = _p.hostname or ""
+            _url_is_ip = all(p.isdigit() for p in _vc_host.split(".") if p)
+            _vc_short  = "" if _url_is_ip else _vc_host.split(".")[0].lower()
+
+            _all_vms = vc_get(vc_url, token, "/api/vcenter/vm") or []
+            _vc_vm = None
+
+            # Strategy 1 — exact short-name match
+            if _vc_short:
+                _vc_vm = next((v for v in _all_vms
+                               if (v.get("name") or "").split(".")[0].lower() == _vc_short), None)
+
+            # Strategy 2 — guest IP match (when URL was an IP address)
+            if not _vc_vm and _vc_own_ip:
+                for _v in _all_vms:
+                    _vid = _v.get("vm", "")
+                    if not _vid:
+                        continue
+                    _guest = vc_get(vc_url, token,
+                                    f"/api/vcenter/vm/{_vid}/guest/networking/interfaces") or []
+                    for _gi in (_guest if isinstance(_guest, list) else []):
+                        for _ga in (_gi.get("ip", {}) or {}).get("ip_addresses", []):
+                            if _ga.get("ip_address") == _vc_own_ip:
+                                _vc_vm = _v
+                                break
+                        if _vc_vm:
+                            break
+                    if _vc_vm:
+                        break
+
+            if _vc_vm:
+                _vm_id = _vc_vm.get("vm", "")
+                _nics  = (vc_get(vc_url, token,
+                                 f"/api/vcenter/vm/{_vm_id}/hardware/ethernet")
+                          or []) if _vm_id else []
+                if _nics:
+                    _nic0     = _nics[0].get("nic", "")
+                    _nic_data = (vc_get(vc_url, token,
+                                       f"/api/vcenter/vm/{_vm_id}/hardware/ethernet/{_nic0}")
+                                 if _nic0 else {})
+                    _pg = ((_nic_data or {}).get("backing") or {}).get("network", "")
+                    if _pg:
+                        result["vm_mgmt_dvpg"] = _pg
         except Exception:
             pass
 
@@ -2899,11 +2996,15 @@ def fix_vna_options():
                 tnc_results = (tnc_resp or {}).get("results", [])
                 if tnc_results:
                     tnc0 = tnc_results[0]
-                    # vm-mgmt DVPG from tag
-                    for tag in (tnc0.get("tags") or []):
-                        if tag.get("scope") == "vcf-orchestration/vm-mgmt-dvpg-moid":
-                            result["vm_mgmt_dvpg"] = tag.get("tag")
-                            break
+                    # vm-mgmt DVPG from tag — only use if non-empty AND not already
+                    # discovered via the vCenter VM NIC lookup (which is more reliable)
+                    if not result["vm_mgmt_dvpg"]:
+                        for tag in (tnc0.get("tags") or []):
+                            if tag.get("scope") == "vcf-orchestration/vm-mgmt-dvpg-moid":
+                                _tval = (tag.get("tag") or "").strip()
+                                if _tval:
+                                    result["vm_mgmt_dvpg"] = _tval
+                                break
                     # overlay TZ path — from TNC → TNP (primary method per doc)
                     tnp_id = tnc0.get("transport_node_profile_id", "")
                     # profile_id may be a full path like "/infra/host-transport-node-profiles/xyz"
@@ -2962,334 +3063,6 @@ def fix_vna_options():
                         result["overlay_tz_path"] = overlay_tzs[0]["path"]
             except Exception:
                 pass
-
-        # ── Priorities 2 & 3: Edge VM / VNA VM port group (via NSX ETNs) ─────────
-        if not result["suggested_pg_id"] and nsx_url:
-            try:
-                _ep2 = ("/policy/api/v1/infra/sites/default"
-                        "/enforcement-points/default")
-                # Collect VNA ETN IDs
-                _vna_ids2: set = set()
-                _vna_cls2 = nsx_get(nsx_url, nsx_user, nsx_pass,
-                    f"{_ep2}/virtual-network-appliance-clusters")
-                for _vc3 in (_vna_cls2 or {}).get("results", []):
-                    for _m3 in _vc3.get("members", []):
-                        _eid3 = (_m3.get("edge_transport_node_path") or "").rstrip("/").split("/")[-1]
-                        if _eid3:
-                            _vna_ids2.add(_eid3)
-                # All ETNs
-                _all_etns3 = (nsx_get(nsx_url, nsx_user, nsx_pass,
-                    f"{_ep2}/edge-transport-nodes") or {}).get("results", [])
-                # Priority 2: first non-VNA ETN → Edge VM
-                _edge3 = next((e for e in _all_etns3 if e.get("id") not in _vna_ids2), None)
-                if _edge3:
-                    _pg3 = (_edge3.get("management_interface") or {}).get("network_id", "")
-                    if _pg3:
-                        result["suggested_pg_id"]    = _pg3
-                        result["suggested_pg_source"] = "Edge VM"
-                        _src_etn_name = (_edge3.get("display_name") or
-                                         _edge3.get("hostname") or "").lower()
-                # Priority 3: first VNA ETN → VNA VM
-                if not result["suggested_pg_id"]:
-                    _vna3 = next((e for e in _all_etns3 if e.get("id") in _vna_ids2), None)
-                    if _vna3:
-                        _pg3 = (_vna3.get("management_interface") or {}).get("network_id", "")
-                        if _pg3:
-                            result["suggested_pg_id"]    = _pg3
-                            result["suggested_pg_source"] = "VNA VM"
-                            _src_etn_name = (_vna3.get("display_name") or
-                                             _vna3.get("hostname") or "").lower()
-            except Exception:
-                pass
-
-        # ── Cluster intelligence ──────────────────────────────────────────────
-        # Build: per-cluster hosts, per-cluster PGs, per-cluster VDS,
-        #        per-cluster datastores, all_same_vds flag,
-        #        source_cluster, suggested_cluster.
-        #
-        # NOTE: The vCenter REST API filter.clusters parameter is NOT supported
-        #       in VCF 9.x / vCenter 9.x (returns HTTP 400 "Unsupported property").
-        #       We use SOAP ContainerView + RetrieveProperties instead, following
-        #       the same pattern as _vc_soap_find_dvs_by_name().
-        try:
-            import re as _re_ci
-
-            _si_s, _si_ep, _si_hdr = _soap_session(vc_url, username, password)
-            # SOAPAction is required for DVS ContainerView in VCF 9.x
-            _si_hdr = {**_si_hdr, "SOAPAction": "urn:vim25/6.7"}
-
-            # ── A. Host → cluster map ─────────────────────────────────────────
-            # ContainerView(HostSystem) → RetrieveProperties(name, parent)
-            _host_cluster: dict = {}  # {host_moref: cluster_moref}
-            _host_name:    dict = {}  # {host_moref: hostname_lower}
-            _cl_hosts:     dict = {}  # {cluster_moref: [hostname_lower]}
-            _cl_hids:      dict = {}  # {cluster_moref: [host_moref]}
-
-            _r_cv_h = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
-                '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                '<Body><CreateContainerView xmlns="urn:vim25">'
-                '<_this type="ViewManager">ViewManager</_this>'
-                '<container type="Folder">group-d1</container>'
-                '<type>HostSystem</type><recursive>true</recursive>'
-                '</CreateContainerView></Body></Envelope>'))
-            _cv_h_m = _re_ci.search(
-                r'<returnval type="ContainerView">([^<]+)</returnval>', _r_cv_h.text)
-            if _cv_h_m:
-                _cv_h = _cv_h_m.group(1).strip()
-                _r_h = _si_s.post(_si_ep, verify=False, timeout=30, headers=_si_hdr, data=(
-                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                    '<Body><RetrieveProperties xmlns="urn:vim25">'
-                    '<_this type="PropertyCollector">propertyCollector</_this>'
-                    '<specSet>'
-                    '<propSet><type>HostSystem</type><all>false</all>'
-                    '<pathSet>name</pathSet><pathSet>parent</pathSet></propSet>'
-                    f'<objectSet><obj type="ContainerView">{_cv_h}</obj>'
-                    '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
-                    ' xsi:type="TraversalSpec"><type>ContainerView</type>'
-                    '<path>view</path></selectSet>'
-                    '</objectSet></specSet>'
-                    '</RetrieveProperties></Body></Envelope>'))
-                for _rv_h in _re_ci.finditer(
-                        r'<returnval>(<obj type="HostSystem">[^<]+</obj>.*?)</returnval>',
-                        _r_h.text, _re_ci.DOTALL):
-                    _chunk_h = _rv_h.group(1)
-                    _hm = _re_ci.search(r'<obj type="HostSystem">([^<]+)</obj>', _chunk_h)
-                    _nm = _re_ci.search(
-                        r'<propSet><name>name</name><val[^>]*>([^<]+)</val></propSet>', _chunk_h)
-                    _pm = _re_ci.search(
-                        r'<propSet><name>parent</name>'
-                        r'<val[^>]*type="ClusterComputeResource"[^>]*>([^<]+)</val></propSet>',
-                        _chunk_h)
-                    if not _hm:
-                        continue
-                    _hid   = _hm.group(1).strip()
-                    _hname = _nm.group(1).strip().lower() if _nm else ""
-                    _cl_id = _pm.group(1).strip() if _pm else None
-                    _host_name[_hid] = _hname
-                    if _cl_id:
-                        _host_cluster[_hid] = _cl_id
-                        _cl_hids.setdefault(_cl_id, []).append(_hid)
-                        _cl_hosts.setdefault(_cl_id, []).append(_hname)
-
-            # ── B. VDS → portgroups map ───────────────────────────────────────
-            # ContainerView(VmwareDistributedVirtualSwitch or DistributedVirtualSwitch)
-            # → RetrieveProperties(name, portgroup)
-            _all_pgs     = result.get("port_groups", [])
-            _pg_by_moref = {p.get("network"): p for p in _all_pgs if p.get("network")}
-            _vds_pg_map: dict = {}  # {vds_name: [REST_dvpg_entries]}
-
-            def _dvs_cv_scan(_dvs_type):
-                """Try to build _vds_pg_map using the given DVS SOAP type name."""
-                _r = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
-                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                    '<Body><CreateContainerView xmlns="urn:vim25">'
-                    '<_this type="ViewManager">ViewManager</_this>'
-                    '<container type="Folder">group-d1</container>'
-                    f'<type>{_dvs_type}</type><recursive>true</recursive>'
-                    '</CreateContainerView></Body></Envelope>'))
-                _cv_m = _re_ci.search(
-                    r'<returnval type="ContainerView">([^<]+)</returnval>', _r.text)
-                if not _cv_m:
-                    return False
-                _cv = _cv_m.group(1).strip()
-                _r2 = _si_s.post(_si_ep, verify=False, timeout=30, headers=_si_hdr, data=(
-                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                    '<Body><RetrieveProperties xmlns="urn:vim25">'
-                    '<_this type="PropertyCollector">propertyCollector</_this>'
-                    '<specSet>'
-                    f'<propSet><type>{_dvs_type}</type><all>false</all>'
-                    '<pathSet>name</pathSet><pathSet>portgroup</pathSet></propSet>'
-                    f'<objectSet><obj type="ContainerView">{_cv}</obj>'
-                    '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
-                    ' xsi:type="TraversalSpec"><type>ContainerView</type>'
-                    '<path>view</path></selectSet>'
-                    '</objectSet></specSet>'
-                    '</RetrieveProperties></Body></Envelope>'))
-                _found = False
-                for _rv in _re_ci.finditer(
-                        r'<returnval>(<obj type="[^"]*VirtualSwitch[^"]*">'
-                        r'[^<]+</obj>.*?)</returnval>',
-                        _r2.text, _re_ci.DOTALL):
-                    _chunk = _rv.group(1)
-                    _nm = _re_ci.search(
-                        r'<propSet><name>name</name><val[^>]*>([^<]+)</val></propSet>',
-                        _chunk)
-                    _pgm = _re_ci.search(
-                        r'<propSet><name>portgroup</name><val[^>]*>(.*?)</val></propSet>',
-                        _chunk, _re_ci.DOTALL)
-                    if not _nm:
-                        continue
-                    _vname = _nm.group(1).strip()
-                    _pg_morefs = _re_ci.findall(
-                        r'type="DistributedVirtualPortgroup"[^>]*>([^<]+)</ManagedObjectReference>',
-                        _pgm.group(1) if _pgm else "")
-                    _vds_pg_map[_vname] = [
-                        _pg_by_moref[m] for m in _pg_morefs if m in _pg_by_moref]
-                    _found = True
-                return _found
-
-            if not _dvs_cv_scan("VmwareDistributedVirtualSwitch"):
-                _dvs_cv_scan("DistributedVirtualSwitch")
-
-            # ── C. Cluster → datastores ───────────────────────────────────────
-            # ContainerView(ClusterComputeResource) → RetrieveProperties(datastore)
-            _all_ds      = result.get("datastores", [])
-            _ds_by_moref = {d.get("datastore"): d for d in _all_ds if d.get("datastore")}
-            _cl_ds: dict = {}
-
-            _r_cv_c = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
-                '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                '<Body><CreateContainerView xmlns="urn:vim25">'
-                '<_this type="ViewManager">ViewManager</_this>'
-                '<container type="Folder">group-d1</container>'
-                '<type>ClusterComputeResource</type><recursive>true</recursive>'
-                '</CreateContainerView></Body></Envelope>'))
-            _cv_c_m = _re_ci.search(
-                r'<returnval type="ContainerView">([^<]+)</returnval>', _r_cv_c.text)
-            if _cv_c_m:
-                _cv_c = _cv_c_m.group(1).strip()
-                _r_c = _si_s.post(_si_ep, verify=False, timeout=30, headers=_si_hdr, data=(
-                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                    '<Body><RetrieveProperties xmlns="urn:vim25">'
-                    '<_this type="PropertyCollector">propertyCollector</_this>'
-                    '<specSet>'
-                    '<propSet><type>ClusterComputeResource</type><all>false</all>'
-                    '<pathSet>datastore</pathSet></propSet>'
-                    f'<objectSet><obj type="ContainerView">{_cv_c}</obj>'
-                    '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
-                    ' xsi:type="TraversalSpec"><type>ContainerView</type>'
-                    '<path>view</path></selectSet>'
-                    '</objectSet></specSet>'
-                    '</RetrieveProperties></Body></Envelope>'))
-                for _rv_c in _re_ci.finditer(
-                        r'<returnval>(<obj type="ClusterComputeResource">'
-                        r'[^<]+</obj>.*?)</returnval>',
-                        _r_c.text, _re_ci.DOTALL):
-                    _chunk_c = _rv_c.group(1)
-                    _cm = _re_ci.search(
-                        r'<obj type="ClusterComputeResource">([^<]+)</obj>', _chunk_c)
-                    _dm = _re_ci.search(
-                        r'<propSet><name>datastore</name><val[^>]*>(.*?)</val></propSet>',
-                        _chunk_c, _re_ci.DOTALL)
-                    if not _cm:
-                        continue
-                    _cl_id_c  = _cm.group(1).strip()
-                    _ds_morefs = _re_ci.findall(
-                        r'type="Datastore"[^>]*>([^<]+)</ManagedObjectReference>',
-                        _dm.group(1) if _dm else "")
-                    _cl_ds[_cl_id_c] = sorted(
-                        [_ds_by_moref[m] for m in _ds_morefs if m in _ds_by_moref],
-                        key=lambda d: d.get("free_space", 0), reverse=True)
-            result["cluster_datastores"] = _cl_ds
-
-            # ── D. VDS per cluster (NSX HTN + host→cluster map) ──────────────
-            _cl_vds: dict = {}
-            if nsx_url:
-                _ep_ht2 = ("/policy/api/v1/infra/sites/default/enforcement-points"
-                           "/default/host-transport-nodes")
-                _htn2 = (nsx_get(nsx_url, nsx_user, nsx_pass,
-                                 _ep_ht2) or {}).get("results", [])
-                _fqdn_vds2: dict = {}
-                for _h2 in _htn2:
-                    _hf = (((_h2.get("node_deployment_info") or {}).get("fqdn") or
-                            _h2.get("display_name") or "")).lower()
-                    for _hs2 in (_h2.get("host_switch_spec") or {}).get("host_switches") or []:
-                        _vn2 = _hs2.get("host_switch_name", "")
-                        if _vn2 and _hf:
-                            _fqdn_vds2[_hf] = _vn2
-                            break
-                for _cmref, _hnames in _cl_hosts.items():
-                    for _hn in _hnames:
-                        _vn2 = _fqdn_vds2.get(_hn)
-                        if _vn2:
-                            _cl_vds[_cmref] = _vn2
-                            break
-            result["cluster_vds_map"] = _cl_vds
-
-            # ── E. Per-cluster port groups (from VDS PG map) ─────────────────
-            _cl_pgs: dict = {}
-            for _cmref, _vds_name in _cl_vds.items():
-                _cl_pgs[_cmref] = _vds_pg_map.get(_vds_name, [])
-            # Graceful fallback: if VDS PG map is unavailable (all clusters have
-            # empty PG lists), assign all port groups to all clusters.
-            if _all_pgs and not any(_cl_pgs.values()):
-                for _cl_item in result.get("clusters", []):
-                    _cl_pgs[_cl_item.get("cluster", "")] = _all_pgs
-            result["cluster_portgroups"] = _cl_pgs
-
-            # ── F. Are all clusters on the same VDS? ──────────────────────────
-            _uniq_vds = set(_cl_vds.values())
-            _all_same = len(_uniq_vds) <= 1
-            result["all_same_vds"] = _all_same
-
-            # ── G. Source cluster (where the pre-selected VM lives) ───────────
-            # Use SOAP RetrieveProperties(runtime.host) on the VM, then map
-            # host → cluster via the _host_cluster dict built in step A.
-            _src_cluster = None
-            _pg_src = result.get("suggested_pg_source", "")
-
-            if _pg_src == "vCenter VM" and _src_vm_id:
-                _r_vm_h = _si_s.post(_si_ep, verify=False, timeout=15, headers=_si_hdr, data=(
-                    '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                    '<Body><RetrieveProperties xmlns="urn:vim25">'
-                    '<_this type="PropertyCollector">propertyCollector</_this>'
-                    '<specSet>'
-                    '<propSet><type>VirtualMachine</type><all>false</all>'
-                    '<pathSet>runtime.host</pathSet></propSet>'
-                    f'<objectSet><obj type="VirtualMachine">{_src_vm_id}</obj>'
-                    '</objectSet></specSet>'
-                    '</RetrieveProperties></Body></Envelope>'))
-                _vm_hm = _re_ci.search(r'type="HostSystem"[^>]*>([^<]+)<', _r_vm_h.text)
-                if _vm_hm:
-                    _src_cluster = _host_cluster.get(_vm_hm.group(1).strip())
-
-                # Fallback: PG uniquely identifies one cluster's VDS
-                if not _src_cluster and result.get("suggested_pg_id"):
-                    _spg = result["suggested_pg_id"]
-                    _hits = [c for c, pgs in _cl_pgs.items()
-                             if any(p.get("network") == _spg for p in pgs)]
-                    if len(_hits) == 1:
-                        _src_cluster = _hits[0]
-
-            elif _pg_src in ("Edge VM", "VNA VM") and _src_etn_name:
-                for _cmref_e, _hnames_e in _cl_hosts.items():
-                    if any(_src_etn_name == _hn or
-                           _src_etn_name.startswith(_hn.split(".")[0]) or
-                           _hn.startswith(_src_etn_name.split(".")[0])
-                           for _hn in _hnames_e):
-                        _src_cluster = _cmref_e
-                        break
-
-            result["source_cluster_moref"] = _src_cluster
-
-            # ── H. Suggested cluster ──────────────────────────────────────────
-            _sugg_cl  = None
-            _sugg_why = None
-            if _all_same:
-                # All clusters share one VDS → pick the one with the most hosts
-                if _cl_hosts:
-                    _best     = max(_cl_hosts.items(), key=lambda x: len(x[1]))
-                    _sugg_cl  = _best[0]
-                    _sugg_why = "most hosts"
-            else:
-                # Dedicated VDSes → must use the source VM's cluster
-                if _src_cluster:
-                    _sugg_cl  = _src_cluster
-                    _sugg_why = f"{_pg_src}'s cluster"
-                else:
-                    # Last resort: PG uniquely identifies cluster
-                    if result.get("suggested_pg_id"):
-                        _spg = result["suggested_pg_id"]
-                        _hits2 = [c for c, pgs in _cl_pgs.items()
-                                  if any(p.get("network") == _spg for p in pgs)]
-                        if len(_hits2) == 1:
-                            _sugg_cl  = _hits2[0]
-                            _sugg_why = "PG's cluster"
-            result["suggested_cluster_moref"]  = _sugg_cl
-            result["suggested_cluster_source"] = _sugg_why
-
-        except Exception:
-            pass   # keep defaults set in result dict initialisation
 
         result["success"] = True
 
@@ -4306,16 +4079,48 @@ def _vc_manage_ssh(vc_url, vc_user, vc_pass, host_fqdn, enable):
         return False, False
 
 
-def _collect_mtu_hosts(nsx_url, nsx_user, nsx_pass):
-    """Return list of dicts {id, name, short, healthy} from NSX HTNs."""
+def _collect_mtu_hosts(nsx_url, nsx_user, nsx_pass, cluster_filter=None,
+                       vc_url=None, vc_user=None, vc_pass=None):
+    """Return list of dicts {id, name, short, healthy} from NSX HTNs.
+
+    cluster_filter: optional list of vCenter cluster morefs; when supplied only
+                    hosts belonging to those clusters are returned.  vCenter
+                    credentials are used to do the lookup (same approach as
+                    dns_check_hosts), which is far more reliable than NSX
+                    compute-collection introspection.
+    """
     ep = "/policy/api/v1/infra/sites/default/enforcement-points/default"
     htn_resp = nsx_get(nsx_url, nsx_user, nsx_pass, f"{ep}/host-transport-nodes")
     htns     = (htn_resp or {}).get("results", [])
+
+    # Build set of allowed host names from vCenter when a filter is requested
+    allowed_names: set = set()   # both FQDN and short names
+    if cluster_filter and vc_url and vc_user and vc_pass:
+        try:
+            _tok, _ = vc_auth(vc_url, vc_user, vc_pass)
+            for moref in cluster_filter:
+                raw = vc_get(vc_url, _tok,
+                             "/api/vcenter/host",
+                             params={"clusters": moref}) or []
+                for h in raw:
+                    hname = h.get("name", "")
+                    if hname:
+                        allowed_names.add(hname)
+                        allowed_names.add(hname.split(".")[0] if "." in hname else hname)
+        except Exception:
+            pass  # if vCenter lookup fails fall through to returning all hosts
+
     hosts = []
     for h in htns:
-        hid  = h.get("id", "")
-        name = h.get("display_name", hid)
-        healthy = False
+        hid   = h.get("id", "")
+        name  = h.get("display_name", hid)
+        short = name.split(".")[0] if "." in name else name
+
+        # Apply cluster filter — only skip when we successfully built the allow-list
+        if allowed_names and name not in allowed_names and short not in allowed_names:
+            continue
+
+        healthy  = False
         has_vmks = False
         try:
             st = nsx_get(nsx_url, nsx_user, nsx_pass,
@@ -4324,14 +4129,14 @@ def _collect_mtu_hosts(nsx_url, nsx_user, nsx_pass):
                 healthy = True
             for hs in (st or {}).get("host_switch_states", []):
                 for ep2 in hs.get("endpoints", []):
-                    if ep2.get("ip") and "overlay" in ep2.get("net_stack_instance_key", "").lower():
+                    if ep2.get("ip") and "overlay" in ep2.get("net_stack_instance_key","").lower():
                         has_vmks = True
         except Exception:
             pass
         hosts.append({
             "id":      hid,
             "name":    name,
-            "short":   name.split(".")[0] if "." in name else name,
+            "short":   short,
             "healthy": healthy,
             "has_vmks": has_vmks,
         })
@@ -4425,10 +4230,17 @@ def mtu_hosts():
     nsx_raw  = (body.get("nsx_url") or "").strip()
     vc_url   = normalize_url(body.get("vc_url", ""))
     nsx_url  = normalize_url(nsx_raw) if nsx_raw else guess_nsx_url(vc_url)
-    nsx_user = body.get("nsx_user") or "admin"
-    nsx_pass = body.get("nsx_pass") or body.get("password") or ""
+    nsx_user       = body.get("nsx_user") or "admin"
+    nsx_pass       = body.get("nsx_pass") or body.get("password") or ""
+    cluster_filter = body.get("cluster_filter") or []
+    vc_user        = body.get("username") or body.get("vc_user") or ""
+    vc_pass        = body.get("password") or body.get("vc_pass") or ""
     try:
-        hosts = _collect_mtu_hosts(nsx_url, nsx_user, nsx_pass)
+        hosts = _collect_mtu_hosts(nsx_url, nsx_user, nsx_pass,
+                                   cluster_filter=cluster_filter or None,
+                                   vc_url=vc_url or None,
+                                   vc_user=vc_user or None,
+                                   vc_pass=vc_pass or None)
         return jsonify({"hosts": hosts})
     except Exception as e:
         return jsonify({"hosts": [], "error": str(e)})
@@ -4959,9 +4771,8 @@ def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, 
     """
     PowerCLI: creates DVPortGroup (unless pg_already_exists) + one vmk per host.
     host_ips: list of (fqdn, ip_str, mask_str) tuples.
-    Returns (vmk_map, pg_created, error_str, vmk_errors)
-      vmk_map:    {fqdn: vmk_name}   — hosts that succeeded
-      vmk_errors: {fqdn: error_msg}  — hosts that failed with their actual PowerCLI error
+    Returns (vmk_map, pg_created, error_str)
+      vmk_map: {fqdn: vmk_name}
     """
     import subprocess, tempfile, os, textwrap, re
     vc_host = vc_url.replace("https://", "").replace("http://", "").rstrip("/")
@@ -5023,55 +4834,36 @@ def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, 
         # Strip ANSI escape codes so error messages are readable
         out = re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', out)
         if "PCLI_SETUP_DONE" not in out:
-            return {}, False, f"PowerCLI setup failed (no DONE marker):\n{out[:2000]}", {}
+            return {}, False, f"PowerCLI setup failed (no DONE marker):\n{out[:2000]}"
         pg_created = "PG:CREATED:" in out
-        vmk_map    = {}
-        vmk_errors = {}
+        vmk_map = {}
         for line in out.splitlines():
             if line.startswith("VMK:"):
                 parts = line.split(":", 2)
                 if len(parts) == 3:
                     vmk_map[parts[1]] = parts[2].strip()
-            elif line.startswith("VMK_ERR:"):
-                parts = line.split(":", 2)
-                if len(parts) == 3:
-                    vmk_errors[parts[1]] = parts[2].strip()
-        return vmk_map, pg_created, "", vmk_errors
+        return vmk_map, pg_created, ""
     except FileNotFoundError:
-        return {}, False, "PowerShell (pwsh) not found — install via: snap install powershell --classic", {}
+        return {}, False, "PowerShell (pwsh) not found — install via: snap install powershell --classic"
     except subprocess.TimeoutExpired:
-        return {}, False, "PowerCLI timed out during setup (>150s)", {}
+        return {}, False, "PowerCLI timed out during setup (>150s)"
     finally:
         try: os.unlink(script_path)
         except Exception: pass
 
 
-def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns,
-                             vds_name=None):
-    """PowerCLI: removes vmks on all hosts + DVPortGroup (best-effort).
-
-    vds_name: when provided, limits PG lookup to that specific VDS (required
-              when multiple clusters share the same PG name on different VDSes).
-    """
+def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns):
+    """PowerCLI: removes vmks on all hosts + DVPortGroup (best-effort)."""
     import subprocess, tempfile, os, textwrap
-    vc_host    = vc_url.replace("https://", "").replace("http://", "").rstrip("/")
+    vc_host = vc_url.replace("https://", "").replace("http://", "").rstrip("/")
     host_array = ", ".join(f"\'{h}\'" for h in host_fqdns)
-    # Build the PowerShell expression that finds the port group.
-    # With a VDS name we scope to that switch; without it we fall back to
-    # searching all VDSes (backward-compatible behaviour).
-    if vds_name:
-        pg_lookup = textwrap.dedent(f"""\
-            $vds = Get-VDSwitch -Name '{vds_name}' -ErrorAction SilentlyContinue
-            $pg  = if ($vds) {{ Get-VDPortgroup -VDSwitch $vds -Name '{pg_name}' -ErrorAction SilentlyContinue }} else {{ $null }}""")
-    else:
-        pg_lookup = f"$pg = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue"
     script = textwrap.dedent(f"""\
         $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $ErrorActionPreference = 'SilentlyContinue'
         Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
         Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
         Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
-        {pg_lookup}
+        $pg = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue
         if ($pg) {{
             foreach ($fqdn in @({host_array})) {{
                 try {{
@@ -6144,29 +5936,19 @@ def check_vlan():
             result["error"] = "No External IP Block matching the DVLAN subnet — complete R5-3 first."
             return jsonify(result)
 
-        # ── 3. Prepared ESX hosts + per-host VDS map ───────────────────────
-        # Each cluster may use its own dedicated VDS (common in multi-cluster VCF).
-        # We read the VDS name per host from NSX HTN host_switch_spec so that
-        # the port group is created on the correct VDS for every host.
+        # ── 3. Prepared ESX hosts + NSX VDS name ───────────────────────────
         htns = (nsx_get(nsx_url, nsx_user, nsx_pass,
             "/policy/api/v1/infra/sites/default/enforcement-points"
             "/default/host-transport-nodes") or {}).get("results", [])
-        nsx_vds_name = ""           # fallback / first VDS seen
-        per_host_vds: dict = {}     # {fqdn: vds_name}
+        nsx_vds_name = ""
         for h in htns:
             fqdn = (h.get("node_deployment_info") or {}).get("fqdn") or h.get("display_name", "")
             if not fqdn: continue
             hosts.append(fqdn)
-            for hs in (h.get("host_switch_spec") or {}).get("host_switches") or []:
-                vn = hs.get("host_switch_name", "")
-                if vn:
-                    per_host_vds[fqdn] = vn
-                    if not nsx_vds_name:
-                        nsx_vds_name = vn
-                    break
-        # Fill in fallback VDS for any host without an explicit entry
-        for fqdn in hosts:
-            per_host_vds.setdefault(fqdn, nsx_vds_name)
+            if not nsx_vds_name:
+                for hs in (h.get("host_switch_spec") or {}).get("host_switches") or []:
+                    nsx_vds_name = hs.get("host_switch_name", "")
+                    if nsx_vds_name: break
         if not hosts:
             result["error"] = "No prepared ESX hosts found — complete S3 (NSX Host Preparation) first."
             return jsonify(result)
@@ -6218,10 +6000,9 @@ def check_vlan():
         # We create only host-0's vmknic first so the IP scan runs before
         # the other hosts' temp IPs exist on the VLAN — any response is a
         # real server, not our own vmknic.
-        pg_name   = f"vcf-vlan-check-{vlan_id}"
-        host0_vds = per_host_vds.get(hosts[0], nsx_vds_name)
-        vmk_map, _pg_created, setup_err, vmk_errors = _pcli_setup_vlan_test(
-            vc_url, vc_user, vc_pass, host0_vds, pg_name, vlan_id,
+        pg_name = f"vcf-vlan-check-{vlan_id}"
+        vmk_map, _pg_created, setup_err = _pcli_setup_vlan_test(
+            vc_url, vc_user, vc_pass, nsx_vds_name, pg_name, vlan_id,
             [(hosts[0], temp_ips[0], mask_str)])
         if setup_err:
             result["error"] = f"PowerCLI setup failed: {setup_err}"
@@ -6367,24 +6148,13 @@ def check_vlan():
                 # Keep SSH enabled — the main gateway-ping loop needs it for host-0
 
         # ── 5c. Phase 2: vmknics for hosts 1-N ────────────────────────────
-        # Group remaining hosts by their VDS — each VDS needs its own call
-        # so the port group is created/reused on the correct switch.
         if len(hosts) > 1:
-            from collections import defaultdict as _ddict
-            _rest_by_vds: dict = _ddict(list)
-            for _i2 in range(1, len(hosts)):
-                _f2  = hosts[_i2]
-                _vn2 = per_host_vds.get(_f2, nsx_vds_name)
-                _rest_by_vds[_vn2].append((_f2, temp_ips[_i2], mask_str))
-            for _vds2, _group2 in _rest_by_vds.items():
-                # PG already exists on host-0's VDS; create a fresh PG on any other VDS
-                _pg_exists2 = (_vds2 == host0_vds)
-                _vmk2, _, _err2, _verr2 = _pcli_setup_vlan_test(
-                    vc_url, vc_user, vc_pass, _vds2, pg_name, vlan_id,
-                    _group2, pg_already_exists=_pg_exists2)
-                if not _err2:
-                    vmk_map.update(_vmk2)
-                vmk_errors.update(_verr2)
+            _ph2_arg = [(hosts[i], temp_ips[i], mask_str) for i in range(1, len(hosts))]
+            _vmk2, _, _err2 = _pcli_setup_vlan_test(
+                vc_url, vc_user, vc_pass, nsx_vds_name, pg_name, vlan_id,
+                _ph2_arg, pg_already_exists=True)
+            if not _err2:
+                vmk_map.update(_vmk2)
 
         # ── 6. Per-host: SSH → gateway ping ───────────────────────────────
         for idx, fqdn in enumerate(hosts):
@@ -6397,9 +6167,8 @@ def check_vlan():
                 "conflict": _prescan_conflict if idx == 0 else None
             }
             result["tests"].append(test)
-            _host_vds = per_host_vds.get(fqdn, nsx_vds_name)
             steps = (list(_prescan_steps) if idx == 0 else []) + [
-                f"✓ VDS='{_host_vds}', PG='{pg_name}' (VLAN {vlan_id})",
+                f"✓ VDS='{nsx_vds_name}', PG='{pg_name}' (VLAN {vlan_id})",
                 f"✓ Temp IP={temp_ip}/{prefix_len}, Gateway={gateway_ip}"
             ]
             ssh_state = None
@@ -6407,13 +6176,8 @@ def check_vlan():
 
             try:
                 if not vmk_dev:
-                    _pcli_err_detail = vmk_errors.get(fqdn, "")
-                    if _pcli_err_detail:
-                        test["error"] = (f"PowerCLI failed to create vmk on {fqdn}: "
-                                         f"{_pcli_err_detail}")
-                    else:
-                        test["error"] = (f"PowerCLI failed to create vmk on {fqdn}. "
-                                         f"Check PowerCLI setup output for VMK_ERR lines.")
+                    test["error"] = (f"PowerCLI failed to create vmk on {fqdn}. "
+                                     f"Check PowerCLI setup output for VMK_ERR lines.")
                     test["output"] = "\n".join(steps); continue
 
                 steps.append(f"✓ vmk created via PowerCLI: {vmk_dev} with IP {temp_ip}/{prefix_len}")
@@ -6566,22 +6330,8 @@ def check_vlan():
         result["error"] = traceback.format_exc()
     finally:
         if pg_name and hosts:
-            # Clean up the temp PG on every VDS that was used.
-            # When per_host_vds is available we call cleanup once per distinct VDS
-            # so the scoped Get-VDPortgroup lookup works correctly.
-            try:
-                _vds_cleanup_map: dict = {}  # {vds_name: [fqdns]}
-                for _cf in hosts:
-                    _cv = per_host_vds.get(_cf, nsx_vds_name) if per_host_vds else nsx_vds_name
-                    _vds_cleanup_map.setdefault(_cv, []).append(_cf)
-                if _vds_cleanup_map:
-                    for _cv, _cf_list in _vds_cleanup_map.items():
-                        _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass,
-                                                pg_name, _cf_list, vds_name=_cv)
-                else:
-                    _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, hosts)
-            except Exception:
-                pass
+            try: _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, hosts)
+            except Exception: pass
 
     return jsonify(result)
 
