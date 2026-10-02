@@ -2,6 +2,7 @@ import ipaddress
 import re
 import time
 import traceback
+import uuid
 import yaml
 from urllib.parse import urlparse
 
@@ -98,6 +99,70 @@ def _detect_sso_domain(www_auth_header: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _vapi_zone_cluster_add(vc_url: str, session_token: str,
+                            zone_name: str, cluster_moref: str) -> None:
+    """Associate a vSphere cluster with a consumption zone via vapi JSON-RPC.
+
+    Uses the vapi HTTP JSON-RPC 2.0 wire format (the same wire format the
+    Python vapi-bindings use) sent to POST /api on the vCenter host.
+    """
+    opid = str(uuid.uuid4())
+    body = {
+        "jsonrpc": "2.0",
+        "method": "invoke",
+        "params": {
+            "serviceId": "com.vmware.vcenter.consumption_domains.zones.cluster.associations",
+            "operationId": "add",
+            "input": {
+                "STRUCTURE": {
+                    "operation-input": {
+                        "zone": zone_name,
+                        "clusters": [cluster_moref]
+                    }
+                }
+            },
+            "ctx": {
+                "appCtx": {"opId": opid},
+                "securityCtx": {
+                    "schemeId": "com.vmware.vapi.std.security.session_id",
+                    "sessionId": session_token
+                }
+            }
+        },
+        "id": "0"
+    }
+    hdrs = {
+        "Content-Type": "application/json",
+        "vapi-service": "com.vmware.vcenter.consumption_domains.zones.cluster.associations",
+        "vapi-operation": "add",
+        "vapi-ctx-opid": opid,
+    }
+    r = SESS.post(f"{vc_url}/api", headers=hdrs, json=body, timeout=30)
+    if not r.ok:
+        raise ValueError(
+            f"vapi zone-cluster add failed: HTTP {r.status_code}: {r.text[:300]}"
+        )
+    resp_data = r.json()
+    if "error" in resp_data:
+        raise ValueError(
+            f"vapi zone-cluster add error: {resp_data['error']}"
+        )
+    # Check result.output for any failures
+    try:
+        struct = (resp_data.get("result", {})
+                  .get("output", {})
+                  .get("STRUCTURE", {}))
+        status_key = "com.vmware.vcenter.consumption_domains.zones.cluster.associations.status"
+        status = struct.get(status_key, {})
+        if not status.get("success", True):
+            failed = status.get("failed_clusters", [])
+            raise ValueError(
+                f"Zone-cluster association failed for {failed}"
+            )
+    except (AttributeError, TypeError):
+        pass  # If response shape differs, the HTTP 200 is sufficient
+
+
 def vc_auth(vc_url: str, username: str, password: str) -> tuple[str, str]:
     """Authenticate to vCenter REST API.
 
@@ -133,6 +198,262 @@ def vc_auth(vc_url: str, username: str, password: str) -> tuple[str, str]:
 
 
 def vc_get(vc_url: str, token: str, path: str, params: dict = None):
+    resp = SESS.get(
+        f"{vc_url}{path}",
+        headers={"vmware-api-session-id": token},
+        params=params,
+        timeout=15,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _vc_soap_get_pg_cluster_map(vc_url: str, username: str, password: str) -> dict:
+    """Return {pg_moref: [cluster_moref, ...]} via SOAP PropertyCollector.
+    Strategy: PG → parent DVS (via config.distributedVirtualSwitch)
+              DVS → connected hosts (via config.host)
+              Cluster → member hosts (via host property)
+    Combine these three to produce the accurate per-cluster PG list.
+    Falls back to {} on any error (REST ?hosts= filter is unreliable in some vCenter versions)."""
+    import re as _re
+    _H = {'Content-Type': 'text/xml; charset=UTF-8', 'SOAPAction': 'urn:vim25/9.0'}
+    _ss = requests.Session()
+    _ss.verify = False
+
+    def _soap(_xml):
+        _r = _ss.post(f"{vc_url}/sdk", timeout=20, headers=_H, data=_xml)
+        return _r.text if _r.ok else ""
+
+    try:
+        # ── Login ──────────────────────────────────────────────────────
+        _soap(f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+<soapenv:Body><vim25:Login>
+<vim25:_this type="SessionManager">SessionManager</vim25:_this>
+<vim25:userName>{username}</vim25:userName>
+<vim25:password>{password}</vim25:password>
+</vim25:Login></soapenv:Body>
+</soapenv:Envelope>""")
+
+        _FOLDER_TRAVERSAL = """
+  <vim25:objectSet>
+    <vim25:obj type="Folder">group-d1</vim25:obj>
+    <vim25:skip>true</vim25:skip>
+    <vim25:selectSet xsi:type="vim25:TraversalSpec">
+      <vim25:name>visitFolders</vim25:name>
+      <vim25:type>Folder</vim25:type>
+      <vim25:path>childEntity</vim25:path>
+      <vim25:skip>false</vim25:skip>
+      <vim25:selectSet><vim25:name>visitFolders</vim25:name></vim25:selectSet>
+      <vim25:selectSet><vim25:name>visitDC_net</vim25:name></vim25:selectSet>
+      <vim25:selectSet><vim25:name>visitDC_host</vim25:name></vim25:selectSet>
+      <vim25:selectSet><vim25:name>visitCluster</vim25:name></vim25:selectSet>
+    </vim25:selectSet>
+    <vim25:selectSet xsi:type="vim25:TraversalSpec">
+      <vim25:name>visitDC_net</vim25:name>
+      <vim25:type>Datacenter</vim25:type>
+      <vim25:path>networkFolder</vim25:path>
+      <vim25:skip>false</vim25:skip>
+      <vim25:selectSet><vim25:name>visitFolders</vim25:name></vim25:selectSet>
+    </vim25:selectSet>
+    <vim25:selectSet xsi:type="vim25:TraversalSpec">
+      <vim25:name>visitDC_host</vim25:name>
+      <vim25:type>Datacenter</vim25:type>
+      <vim25:path>hostFolder</vim25:path>
+      <vim25:skip>false</vim25:skip>
+      <vim25:selectSet><vim25:name>visitFolders</vim25:name></vim25:selectSet>
+    </vim25:selectSet>
+    <vim25:selectSet xsi:type="vim25:TraversalSpec">
+      <vim25:name>visitCluster</vim25:name>
+      <vim25:type>ClusterComputeResource</vim25:type>
+      <vim25:path>host</vim25:path>
+      <vim25:skip>false</vim25:skip>
+    </vim25:selectSet>
+  </vim25:objectSet>"""
+
+        # ── Query 1: DVS → connected hosts ────────────────────────────
+        _rA = _soap(f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:vim25="urn:vim25">
+<soapenv:Body>
+<vim25:RetrievePropertiesEx>
+<vim25:_this type="PropertyCollector">propertyCollector</vim25:_this>
+<vim25:specSet>
+  <vim25:propSet>
+    <vim25:type>VmwareDistributedVirtualSwitch</vim25:type>
+    <vim25:all>false</vim25:all>
+    <vim25:pathSet>config.host</vim25:pathSet>
+  </vim25:propSet>
+  {_FOLDER_TRAVERSAL}
+</vim25:specSet>
+<vim25:options/>
+</vim25:RetrievePropertiesEx>
+</soapenv:Body></soapenv:Envelope>""")
+        dvs_hosts: dict = {}  # dvs_moref → [host_morefs]
+        for _blk in _re.findall(r'<objects>(.*?)</objects>', _rA, _re.DOTALL):
+            _dm = _re.search(r'<obj type="VmwareDistributedVirtualSwitch">(dvs-\d+)</obj>', _blk)
+            _hs = _re.findall(r'type="HostSystem"[^>]*>(host-\d+)<', _blk)
+            if _dm and _hs:
+                dvs_hosts[_dm.group(1)] = _hs
+
+        # ── Query 2: Cluster → member hosts ───────────────────────────
+        _rB = _soap(f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:vim25="urn:vim25">
+<soapenv:Body>
+<vim25:RetrievePropertiesEx>
+<vim25:_this type="PropertyCollector">propertyCollector</vim25:_this>
+<vim25:specSet>
+  <vim25:propSet>
+    <vim25:type>ClusterComputeResource</vim25:type>
+    <vim25:all>false</vim25:all>
+    <vim25:pathSet>host</vim25:pathSet>
+  </vim25:propSet>
+  {_FOLDER_TRAVERSAL}
+</vim25:specSet>
+<vim25:options/>
+</vim25:RetrievePropertiesEx>
+</soapenv:Body></soapenv:Envelope>""")
+        cluster_hosts: dict = {}  # cluster_moref → [host_morefs]
+        for _blk in _re.findall(r'<objects>(.*?)</objects>', _rB, _re.DOTALL):
+            _cm = _re.search(r'<obj type="ClusterComputeResource">(domain-c\d+)</obj>', _blk)
+            _hs = _re.findall(r'<ManagedObjectReference[^>]*type="HostSystem"[^>]*>(host-\d+)</ManagedObjectReference>', _blk)
+            if not _hs:
+                _hs = _re.findall(r'type="HostSystem"[^>]*>(host-\d+)<', _blk)
+            if _cm and _hs:
+                cluster_hosts[_cm.group(1)] = _hs
+
+        # ── Query 3: DVPG → parent DVS ────────────────────────────────
+        _rC = _soap(f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:vim25="urn:vim25">
+<soapenv:Body>
+<vim25:RetrievePropertiesEx>
+<vim25:_this type="PropertyCollector">propertyCollector</vim25:_this>
+<vim25:specSet>
+  <vim25:propSet>
+    <vim25:type>DistributedVirtualPortgroup</vim25:type>
+    <vim25:all>false</vim25:all>
+    <vim25:pathSet>config.distributedVirtualSwitch</vim25:pathSet>
+  </vim25:propSet>
+  {_FOLDER_TRAVERSAL}
+</vim25:specSet>
+<vim25:options/>
+</vim25:RetrievePropertiesEx>
+</soapenv:Body></soapenv:Envelope>""")
+        pg_dvs: dict = {}  # pg_moref → dvs_moref
+        for _blk in _re.findall(r'<objects>(.*?)</objects>', _rC, _re.DOTALL):
+            _pg = _re.search(r'<obj type="DistributedVirtualPortgroup">(dvportgroup-\d+)</obj>', _blk)
+            _dv = _re.search(r'<val[^>]*>(dvs-\d+)</val>', _blk)
+            if not _dv:
+                _dv = _re.search(r'type="[^"]*VirtualSwitch[^"]*">(dvs-\d+)<', _blk)
+            if _pg and _dv:
+                pg_dvs[_pg.group(1)] = _dv.group(1)
+
+        # ── Combine ────────────────────────────────────────────────────
+        # host → cluster
+        _host_cluster: dict = {_h: _c for _c, _hs in cluster_hosts.items() for _h in _hs}
+        # DVS → [cluster_morefs]
+        _dvs_clusters: dict = {}
+        for _dvs_id, _hs in dvs_hosts.items():
+            for _h in _hs:
+                _c = _host_cluster.get(_h)
+                if _c:
+                    _dvs_clusters.setdefault(_dvs_id, [])
+                    if _c not in _dvs_clusters[_dvs_id]:
+                        _dvs_clusters[_dvs_id].append(_c)
+        # PG → [cluster_morefs]
+        _result: dict = {}
+        for _pg_id, _dvs_id in pg_dvs.items():
+            _clusters = _dvs_clusters.get(_dvs_id, [])
+            if _clusters:
+                _result[_pg_id] = _clusters
+        return _result
+    except Exception:
+        return {}
+
+
+def _vc_soap_get_dvpg_vlans(vc_url: str, username: str, password: str) -> dict:
+    """Use vSphere SOAP PropertyCollector to batch-fetch VLAN IDs for all DVPGs.
+    Returns {portgroup_moref: vlan_id} dict, e.g. {'dvportgroup-24': 10}.
+    Falls back to {} on any error (vCenter unreachable, wrong creds, etc.).
+    Works on vCenter 9.x where the /api/vcenter/network/distributed-port-group/{id} REST
+    endpoint returns 404."""
+    import re as _re
+    _H = {'Content-Type': 'text/xml; charset=UTF-8', 'SOAPAction': 'urn:vim25/9.0'}
+    _ss = requests.Session()
+    _ss.verify = False
+    try:
+        # SOAP Login (separate session — doesn't disturb the REST session)
+        _lr = _ss.post(f"{vc_url}/sdk", timeout=15, headers=_H, data=
+            f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:vim25="urn:vim25">
+<soapenv:Body>
+<vim25:Login>
+<vim25:_this type="SessionManager">SessionManager</vim25:_this>
+<vim25:userName>{username}</vim25:userName>
+<vim25:password>{password}</vim25:password>
+</vim25:Login>
+</soapenv:Body>
+</soapenv:Envelope>""")
+        if not _lr.ok:
+            return {}
+        # Batch PropertyCollector: traverse Folder→Datacenter→NetworkFolder→DVPGs
+        _pr = _ss.post(f"{vc_url}/sdk", timeout=20, headers=_H, data=
+            """<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:vim25="urn:vim25">
+<soapenv:Body>
+<vim25:RetrievePropertiesEx>
+<vim25:_this type="PropertyCollector">propertyCollector</vim25:_this>
+<vim25:specSet>
+  <vim25:propSet>
+    <vim25:type>DistributedVirtualPortgroup</vim25:type>
+    <vim25:all>false</vim25:all>
+    <vim25:pathSet>config</vim25:pathSet>
+    <vim25:pathSet>name</vim25:pathSet>
+  </vim25:propSet>
+  <vim25:objectSet>
+    <vim25:obj type="Folder">group-d1</vim25:obj>
+    <vim25:skip>true</vim25:skip>
+    <vim25:selectSet xsi:type="vim25:TraversalSpec">
+      <vim25:name>visitFolders</vim25:name>
+      <vim25:type>Folder</vim25:type>
+      <vim25:path>childEntity</vim25:path>
+      <vim25:skip>false</vim25:skip>
+      <vim25:selectSet><vim25:name>visitFolders</vim25:name></vim25:selectSet>
+      <vim25:selectSet><vim25:name>visitDC</vim25:name></vim25:selectSet>
+    </vim25:selectSet>
+    <vim25:selectSet xsi:type="vim25:TraversalSpec">
+      <vim25:name>visitDC</vim25:name>
+      <vim25:type>Datacenter</vim25:type>
+      <vim25:path>networkFolder</vim25:path>
+      <vim25:skip>false</vim25:skip>
+      <vim25:selectSet><vim25:name>visitFolders</vim25:name></vim25:selectSet>
+    </vim25:selectSet>
+  </vim25:objectSet>
+</vim25:specSet>
+<vim25:options/>
+</vim25:RetrievePropertiesEx>
+</soapenv:Body>
+</soapenv:Envelope>""")
+        if not _pr.ok:
+            return {}
+        # Parse: each <objects> block has one dvportgroup moref + its config
+        _result = {}
+        for _block in _re.findall(r'<objects>(.*?)</objects>', _pr.text, _re.DOTALL):
+            _m = _re.search(r'<obj type="DistributedVirtualPortgroup">(dvportgroup-\d+)</obj>', _block)
+            _v = _re.search(r'<vlanId>(\d+)</vlanId>', _block)
+            if _m and _v:
+                _result[_m.group(1)] = int(_v.group(1))
+        return _result
+    except Exception:
+        return {}
+
+
+
     resp = SESS.get(
         f"{vc_url}{path}",
         headers={"vmware-api-session-id": token},
@@ -483,10 +804,32 @@ def check_requirements():
             ec = nsx_get(nsx_url, nsx_user, nsx_pass,
                 "/policy/api/v1/infra/sites/default/enforcement-points/default/edge-clusters")
             d["ec"] = (ec or {}).get("results", [])
+            # Fetch form_factor for every edge transport node that belongs to an EC
+            _ec_ep = "/policy/api/v1/infra/sites/default/enforcement-points/default"
+            _ec_etn_ids: set = set()
+            for _ec_obj in d["ec"]:
+                for _pen in (_ec_obj.get("policy_edge_nodes") or []):
+                    _etn_path = _pen.get("edge_transport_node_path", "")
+                    _etn_id = _etn_path.rstrip("/").split("/")[-1]
+                    if _etn_id:
+                        _ec_etn_ids.add(_etn_id)
+            _ec_ff: dict = {}  # etn_id → {"name": ..., "form_factor": ...}
+            if _ec_etn_ids:
+                _etns_raw = nsx_get(nsx_url, nsx_user, nsx_pass,
+                    f"{_ec_ep}/edge-transport-nodes")
+                for _etn in (_etns_raw or {}).get("results", []):
+                    _eid = _etn.get("id", "")
+                    if _eid in _ec_etn_ids:
+                        _ec_ff[_eid] = {
+                            "name": _etn.get("display_name") or _etn.get("hostname") or _eid,
+                            "form_factor": _etn.get("form_factor", "UNKNOWN"),
+                        }
+            d["ec_node_form_factors"] = _ec_ff
             t0 = nsx_get(nsx_url, nsx_user, nsx_pass, "/policy/api/v1/infra/tier-0s")
             d["t0"] = (t0 or {}).get("results", [])
         except Exception as e:
-            d["vna"] = []; d["ec"] = []; d["t0"] = []; d["topo_error"] = str(e)
+            d["vna"] = []; d["ec"] = []; d["t0"] = []
+            d["ec_node_form_factors"] = {}; d["topo_error"] = str(e)
 
         try:
             dv = nsx_get(nsx_url, nsx_user, nsx_pass,
@@ -691,11 +1034,22 @@ def check_requirements():
             else:
                 add("2", "vSphere HA / DRS", "warning", "No clusters found via vCenter API.")
 
-        # ── Steps 3-8: NSX checks ────────────────────────────────────────────
+        # ── Step 2: vCenter FQDN (all modes) ────────────────────────────────
+        _vc_fqdn = urlparse(vc_url).hostname or ""
+        if _vc_fqdn.lower().endswith(".local"):
+            add("3", "vCenter FQDN", "error",
+                f"vCenter FQDN ends with '.local' — not supported for Supervisor Deployment",
+                f"Your vCenter FQDN is '{_vc_fqdn}' which is not supported for Supervisor Deployment.")
+        else:
+            add("3", "vCenter FQDN", "ok",
+                _vc_fqdn,
+                _vc_fqdn)
+
+        # ── Steps 3-8: NSX checks ─────────────────────────────────────────────
         nsx_na = "Not required for this deployment mode."
 
         if mode == "vds_flb":
-            add("3", "VLANs/Subnets for Supervisor and FLB", "info",
+            add("4", "VLANs/Subnets for Supervisor and FLB", "info",
                 "Validation to do by Admin",
                 "Supervisor deployment with VDS requires subnets for Supervisor and FLB.")
         elif not nsx_url:
@@ -704,14 +1058,14 @@ def check_requirements():
                              else "External Connection")
             for sn, nm in [
                 ("3", "NSX Host Preparation"), ("4", "NSX Networking"),
-                ("5-1", ext_conn_name),           ("5-2", "TGW Attachment"),
-                ("5-3", "External IP Block"),    ("5-4", "VPC Profile"),
+                ("6-1", ext_conn_name),           ("6-2", "TGW Attachment"),
+                ("6-3", "External IP Block"),    ("6-4", "VPC Profile"),
             ]:
                 add(sn, nm, "warning", "NSX URL not provided — enter it in the NSX section above.")
         else:
             # Step 2: TEPs (same for both NSX modes)
             if "tep_error" in d:
-                add("3", "NSX Host Preparation", "warning", f"Could not check: {d['tep_error']}")
+                add("4", "NSX Host Preparation", "warning", f"Could not check: {d['tep_error']}")
             elif d.get("tnc") or d.get("htn"):
                 tncs             = d.get("tnc", [])
                 htn_states       = d.get("htn_states", {})
@@ -803,52 +1157,60 @@ def check_requirements():
                                    f"{', '.join(cluster_names)} — "
                                    f"{fail_count} host(s) with issues")
 
-                add("3", "NSX Host Preparation", step_status, subtitle,
+                add("4", "NSX Host Preparation", step_status, subtitle,
                     "\n".join(detail_lines))
             else:
-                add("3", "NSX Host Preparation", "error",
+                add("4", "NSX Host Preparation", "error",
                     "No ESXi hosts prepared with NSX.",
                     "Without NSX host prep, Supervisor cannot use NSX-VPC networking.")
 
             # Step 3: networking topology (mode-specific)
             if mode == "distributed":
                 if "topo_error" in d:
-                    add("4", "VNA Cluster", "warning", f"Could not check: {d['topo_error']}")
+                    add("5", "VNA Cluster", "warning", f"Could not check: {d['topo_error']}")
                 elif d.get("vna"):
                     vna_states = d.get("vna_states") or {}
                     detail_lines = []
                     all_ok = True
                     any_deploying = False
                     any_failed = False
+                    any_ff_small = False
                     names = []
                     for vna in d["vna"]:
                         cid     = vna.get("id", "?")
                         cname   = vna.get("display_name", cid)
                         cstatus = vna_states.get(cid, "UNKNOWN")
+                        cff     = vna.get("appliance_form_factor", "UNKNOWN")
                         names.append(cname)
-                        detail_lines.append(f"· {cname}: {cstatus}")
+                        detail_lines.append(f"· {cname}: {cstatus}  (form_factor: {cff})")
                         if cstatus != "SUCCESS":
                             all_ok = False
                         if cstatus in ("IN_PROGRESS", "PENDING", "DEPLOYING"):
                             any_deploying = True
                         if cstatus in ("FAILED", "ERROR", "PARTIAL_SUCCESS"):
                             any_failed = True
+                        if cff.upper() == "SMALL":
+                            any_ff_small = True
                     detail = "\n".join(detail_lines)
                     names_str = ", ".join(names)
-                    if all_ok:
-                        add("4", "VNA Cluster", "ok",
+                    if any_ff_small:
+                        add("5", "VNA Cluster", "error",
+                            f"VNA Cluster: SMALL form factor not supported (MEDIUM required)",
+                            detail)
+                    elif all_ok:
+                        add("5", "VNA Cluster", "ok",
                             f"VNA Cluster found: {names_str}", detail)
                     elif any_failed:
-                        add("4", "VNA Cluster", "error",
+                        add("5", "VNA Cluster", "error",
                             f"VNA Cluster deployment failed", detail, can_fix=True)
                     elif any_deploying:
-                        add("4", "VNA Cluster", "warning",
+                        add("5", "VNA Cluster", "warning",
                             f"VNA Cluster deploying: {names_str}", detail)
                     else:
-                        add("4", "VNA Cluster", "warning",
+                        add("5", "VNA Cluster", "warning",
                             f"VNA Cluster status unknown: {names_str}", detail)
                 else:
-                    add("4", "VNA Cluster", "error",
+                    add("5", "VNA Cluster", "error",
                         "No VNA Cluster found.",
                         "A VNA Cluster is required for Distributed NSX-VPC mode.\n"
                         "This tool will guide you through the installation.\n\n"
@@ -857,21 +1219,42 @@ def check_requirements():
                         can_fix=True)
             else:  # centralized
                 if "topo_error" in d:
-                    add("4", "Edge Cluster + Tier-0", "warning", f"Could not check: {d['topo_error']}")
+                    add("5", "Edge Cluster + Tier-0", "warning", f"Could not check: {d['topo_error']}")
                 elif d.get("ec") and d.get("t0"):
-                    ec_lines = "\n".join(f"  - {e.get('display_name','?')}" for e in d["ec"])
+                    ec_node_ff = d.get("ec_node_form_factors") or {}
+                    ec_lines = []
+                    for _ec_obj in d["ec"]:
+                        _ecn = _ec_obj.get("display_name", _ec_obj.get("id", "?"))
+                        ec_lines.append(f"  - {_ecn}")
+                        for _pen in (_ec_obj.get("policy_edge_nodes") or []):
+                            _etn_path = _pen.get("edge_transport_node_path", "")
+                            _etn_id = _etn_path.rstrip("/").split("/")[-1]
+                            _pen_id = _pen.get("id", _etn_id)
+                            _ff_info = ec_node_ff.get(_etn_id) or {}
+                            _ff = _ff_info.get("form_factor", "UNKNOWN")
+                            ec_lines.append(f"    · {_pen_id}: form_factor={_ff}")
                     t0_lines = "\n".join(f"  - {t.get('display_name','?')}" for t in d["t0"])
-                    detail   = f"· Edge cluster(s):\n{ec_lines}\n· Tier-0(s):\n{t0_lines}"
-                    add("4", "Edge Cluster + Tier-0", "ok",
-                        "Edge Cluster + Tier-0 found", detail)
+                    detail = "· Edge cluster(s):\n" + "\n".join(ec_lines) + "\n· Tier-0(s):\n" + t0_lines
+                    _small_nodes = [
+                        info.get("name", eid)
+                        for eid, info in ec_node_ff.items()
+                        if (info.get("form_factor") or "").upper() == "SMALL"
+                    ]
+                    if _small_nodes:
+                        add("5", "Edge Cluster + Tier-0", "error",
+                            f"Edge node(s) have SMALL form factor (MEDIUM required): {', '.join(_small_nodes)}",
+                            detail)
+                    else:
+                        add("5", "Edge Cluster + Tier-0", "ok",
+                            "Edge Cluster + Tier-0 found", detail)
                 elif d.get("ec"):
-                    add("4", "Edge Cluster + Tier-0", "error",
+                    add("5", "Edge Cluster + Tier-0", "error",
                         "Edge Cluster found but no Tier-0.",
                         f"Edge clusters: {[e.get('display_name','?') for e in d['ec']]}\n"
                         "A Tier-0 with BGP is required for Centralized NSX-VPC mode.",
                         can_fix=True)
                 else:
-                    add("4", "Edge Cluster + Tier-0", "error",
+                    add("5", "Edge Cluster + Tier-0", "error",
                         "No Edge Cluster found.",
                         "An Edge Cluster with Tier-0 + BGP is required for Centralized NSX-VPC.\n"
                         "This tool does not automate Edge Cluster + Tier-0 deployment.\n"
@@ -883,7 +1266,7 @@ def check_requirements():
             # Step 4: external connection (mode-specific)
             if mode == "distributed":
                 if "extconn_error" in d:
-                    add("5-1", "Distributed External Connection", "warning", f"Could not check: {d['extconn_error']}")
+                    add("6-1", "Distributed External Connection", "warning", f"Could not check: {d['extconn_error']}")
                 elif d.get("dvlan"):
                     names = [dc.get("display_name", dc.get("id", "?")) for dc in d["dvlan"]]
                     detail_lines = []
@@ -892,11 +1275,11 @@ def check_requirements():
                         vlan = dc.get("vlan_id", "?")
                         gws  = ", ".join(dc.get("gateway_addresses") or []) or "?"
                         detail_lines.append(f"· {name}\n  VLAN ID: {vlan}\n  Gateway: {gws}")
-                    add("5-1", "Distributed External Connection", "ok",
+                    add("6-1", "Distributed External Connection", "ok",
                         f"{len(d['dvlan'])} Distributed External Connection(s): {', '.join(names)}",
                         "\n".join(detail_lines))
                 else:
-                    add("5-1", "Distributed External Connection", "error",
+                    add("6-1", "Distributed External Connection", "error",
                         "No Distributed External Connection found.",
                         "The Distributed External Connection is the connection to the physical fabric.\n"
                         "In the Distributed option, that's a VLAN / physical gateway.\n"
@@ -905,7 +1288,7 @@ def check_requirements():
                         can_fix=True)
             else:  # centralized
                 if "extconn_error" in d:
-                    add("5-1", "Centralized External Connection", "warning", f"Could not check: {d['extconn_error']}")
+                    add("6-1", "Centralized External Connection", "warning", f"Could not check: {d['extconn_error']}")
                 elif d.get("gw_conn"):
                     detail_lines = []
                     for gc in d["gw_conn"]:
@@ -913,11 +1296,11 @@ def check_requirements():
                         t0    = (gc.get("tier0_path") or "?").rstrip("/").split("/")[-1]
                         detail_lines.append(f"· {name}\n  Tier-0: {t0}")
                     names = [gc.get("display_name", gc.get("id","?")) for gc in d["gw_conn"]]
-                    add("5-1", "Centralized External Connection", "ok",
+                    add("6-1", "Centralized External Connection", "ok",
                         f"{len(d['gw_conn'])} Centralized External Connection(s): {', '.join(names)}",
                         "\n".join(detail_lines))
                 else:
-                    add("5-1", "Centralized External Connection", "error",
+                    add("6-1", "Centralized External Connection", "error",
                         "No Centralized External Connection found.",
                         "The Centralized External Connection is the connection to the physical fabric.\n"
                         "In the Centralized option, that's an NSX Tier-0.\n"
@@ -926,7 +1309,7 @@ def check_requirements():
 
             # Step 5: TGW attachment — mode-specific connection type check
             if "tgw_error" in d:
-                add("5-2", "Distributed Transit Gateway" if mode == "distributed" else "TGW Attachment",
+                add("6-2", "Distributed Transit Gateway" if mode == "distributed" else "TGW Attachment",
                     "warning", f"Could not check: {d['tgw_error']}")
             else:
                 all_att_global = d.get("tgw_all_att", d.get("tgw_att", []))
@@ -955,13 +1338,13 @@ def check_requirements():
                             for cp in cps:
                                 conn_name = cp.rstrip("/").split("/")[-1]
                                 lines.append(f"  Attached to: {conn_name}")
-                        add("5-2", "Distributed Transit Gateway", "ok",
+                        add("6-2", "Distributed Transit Gateway", "ok",
                             dist_subtitle,
                             "\n".join(lines), tgw_name=first_tgw_name)
                     elif d.get("tgw"):
                         if centralized_att:
                             # Case 2: Default TGW is already Centralized → must create a new TGW
-                            add("5-2", "Distributed Transit Gateway", "error",
+                            add("6-2", "Distributed Transit Gateway", "error",
                                 "No Distributed Transit Gateway",
                                 "The Default Transit Gateway is already configured as Centralized.\n"
                                 "A new Distributed Transit Gateway must be created and attached\n"
@@ -970,12 +1353,12 @@ def check_requirements():
                                 can_fix=True)
                         else:
                             # Case 1: Default TGW has no connection → attach it
-                            add("5-2", "Distributed Transit Gateway", "error",
+                            add("6-2", "Distributed Transit Gateway", "error",
                                 "No existing Distributed Transit Gateway.",
                                 "This tool will guide you through attaching it to a Distributed External Connection.",
                                 can_fix=True)
                     else:
-                        add("5-2", "Distributed Transit Gateway", "error",
+                        add("6-2", "Distributed Transit Gateway", "error",
                             "Default Transit Gateway not found.",
                             "The Transit Gateway is required for NSX-VPC networking.\n"
                             "This tool will guide you through the configuration.",
@@ -1018,15 +1401,15 @@ def check_requirements():
                                     lines.append(f"  Edge Cluster: {ec_name}")
                             except Exception:
                                 pass
-                        add("5-2", "Centralized Transit Gateway", "ok",
+                        add("6-2", "Centralized Transit Gateway", "ok",
                             subtitle, "\n".join(lines), tgw_name=tgw_names[0] if tgw_names else "")
                     elif d.get("tgw"):
-                        add("5-2", "Centralized Transit Gateway", "error",
+                        add("6-2", "Centralized Transit Gateway", "error",
                             "No existing Centralized Transit Gateway.",
                             "This tool will guide you through attaching it to a Centralized External Connection.",
                             can_fix=True)
                     else:
-                        add("5-2", "Centralized Transit Gateway", "error",
+                        add("6-2", "Centralized Transit Gateway", "error",
                             "Default Transit Gateway not found.",
                             "The Transit Gateway is required for NSX-VPC networking.\n"
                             "This tool will guide you through the configuration.",
@@ -1034,7 +1417,7 @@ def check_requirements():
 
             # Step 6: external IP blocks — mode-specific validity check
             if "blocks_error" in d:
-                add("5-3", "External IP Block", "warning", f"Could not check: {d['blocks_error']}")
+                add("6-3", "External IP Block", "warning", f"Could not check: {d['blocks_error']}")
             else:
                 all_ext = d.get("ext_blocks", [])
 
@@ -1075,7 +1458,7 @@ def check_requirements():
                         if excl:
                             line += f"\n  Excluded ranges: {excl}"
                         detail_lines.append(line)
-                    add("5-3", "External IP Block", "ok",
+                    add("6-3", "External IP Block", "ok",
                         f"{len(valid_blocks)} External IP block(s): {', '.join(block_info)}",
                         "\n".join(detail_lines))
                 else:
@@ -1111,7 +1494,7 @@ def check_requirements():
                             "which the physical fabric will learn from the T0-BGP." + overlap_note + "\n"
                             "This tool will guide you through the creation of an External IP Block."
                         )
-                    add("5-3", "External IP Block", "error",
+                    add("6-3", "External IP Block", "error",
                         "No External IP Block found.",
                         ext_detail,
                         can_fix=True)
@@ -1121,7 +1504,7 @@ def check_requirements():
                        if mode == "distributed"
                        else "Centralized VPC Connectivity Profile")
             if "vcp_error" in d:
-                add("5-4", title_7, "warning", f"Could not check: {d['vcp_error']}")
+                add("6-4", title_7, "warning", f"Could not check: {d['vcp_error']}")
             else:
                 all_vcps      = d.get("all_vcps", [v for v in [d.get("vcp")] if v])
                 cluster_label = "VNA Cluster" if mode == "distributed" else "Edge Cluster"
@@ -1249,7 +1632,7 @@ def check_requirements():
                     _first_nondefault = next(
                         (p for p in _deploy_projects if p["id"] != "default"), None)
                     _proj_hint = " | ".join(p["display_name"] for p in _deploy_projects)
-                    add("5-4", title_7, "ok", subtitle, "\n".join(lines),
+                    add("6-4", title_7, "ok", subtitle, "\n".join(lines),
                         valid_vcps_for_deploy=_deploy_projects,
                         vcp_nsx_proj=(_first_nondefault["id"] if _first_nondefault else None),
                         vcp_proj_hint=_proj_hint)
@@ -1263,7 +1646,7 @@ def check_requirements():
                                  f"  · {cluster_label}",
                                  "  · N/S Services",
                                  "  · Outbound NAT"]
-                    add("5-4", title_7, "error",
+                    add("6-4", title_7, "error",
                         f"No valid {title_7} in any NSX Project",
                         "VPC Connectivity Profile requires the following settings:\n"
                         + "\n".join(req_lines)
@@ -1302,10 +1685,12 @@ def discover_install_options():
         "clusters": [],
         "storage_policies": [],
         "port_groups": [],
+        "pg_clusters_map": {},   # pg_moref → [cluster_moref, ...] built via SOAP
         "vc_defaults": {
             "gateway": "", "prefix": 24, "dns_servers": [],
             "search_domains": [], "ntp_servers": [],
             "vc_pg_id": "",   # port group of the vCenter VM (empty if not found in this VC)
+            "vc_pg_vlan_id": None,  # VLAN ID of the vCenter VM's port group
         },
         "node_defaults": {},
         "nsx_project_path": "/orgs/default/projects/default",
@@ -1317,6 +1702,9 @@ def discover_install_options():
 
     try:
         token, _ = vc_auth(vc_url, username, password)
+
+        # Batch-fetch all DVPG VLAN IDs via SOAP PropertyCollector (REST endpoint 404 on vCenter 9.x)
+        _dvpg_vlans: dict = _vc_soap_get_dvpg_vlans(vc_url, username, password)
 
         _raw_clusters = vc_get(vc_url, token, "/api/vcenter/cluster") or []
         result["clusters"] = _raw_clusters
@@ -1404,6 +1792,15 @@ def discover_install_options():
                    params={"types": "DISTRIBUTED_PORTGROUP"}) or []
         )
 
+        # Enrich each distributed port group with its VLAN ID (from SOAP batch-fetch above)
+        for _pg_obj in result["port_groups"]:
+            _pgid = _pg_obj.get("network", "")
+            if _pgid and _pgid in _dvpg_vlans:
+                _pg_obj["vlan_id"] = _dvpg_vlans[_pgid]
+
+        # Build pg_clusters_map via SOAP (REST ?hosts= filter is unreliable in some vCenter versions)
+        result["pg_clusters_map"] = _vc_soap_get_pg_cluster_map(vc_url, username, password)
+
         # Get the vCenter appliance's own IP and gateway from /api/appliance/networking
         # (this works whether the user connected by FQDN or by IP).
         _vc_own_ip = ""
@@ -1488,7 +1885,8 @@ def discover_install_options():
                                       f"/api/vcenter/vm/{_vm_id}/hardware/ethernet/{_nic0}") if _nic0 else {}
                     _pg = ((_nic_data or {}).get("backing") or {}).get("network", "")
                     if _pg:
-                        result["vc_defaults"]["vc_pg_id"] = _pg
+                        result["vc_defaults"]["vc_pg_id"]    = _pg
+                        result["vc_defaults"]["vc_pg_vlan_id"] = _dvpg_vlans.get(_pg)
                 # Also derive the short name from the found VM (for search domain)
                 if _url_is_ip and not _vc_short:
                     _vc_short = (_vc_vm.get("name") or "").split(".")[0].lower()
@@ -1619,11 +2017,14 @@ def discover_install_options():
                 _host  = _etn.get("hostname", "")
                 _parts = _host.split(".")
                 _domain = ".".join(_parts[1:]) if len(_parts) > 1 else ""
+                # Try to get the VLAN ID for this port group from the SOAP batch dict
+                _etn_vlan_id = _dvpg_vlans.get(_pg_id) if _pg_id else None
                 return {
                     "pg_id":       _pg_id,
                     "pg_name":     _pg_map.get(_pg_id, _pg_id),
                     "gateway_cidr": f"{_gw}/{_pfx}" if _gw else "",
                     "search_domain": _domain,
+                    "vlan_id":     _etn_vlan_id,
                 }
 
             # Shared DNS/NTP from NSX manager
@@ -1667,102 +2068,217 @@ def discover_install_options():
 
 @app.route("/api/storage-policies-for-cluster", methods=["POST"])
 def storage_policies_for_cluster():
-    """Return storage policies compatible with the given cluster's datastores."""
-    body          = request.get_json(force=True)
-    vc_url        = normalize_url(body.get("vc_url", ""))
-    username      = body.get("username", "")
-    password      = body.get("password", "")
-    cluster_moref = body.get("cluster_moref", "")
-    result        = {"policies": [], "error": None}
+    """Return storage policies compatible with ALL selected clusters.
+
+    1. Collect the ESX hosts of every selected cluster.
+    2. Work out which datastores each host can access.
+    3. Work out which policies are compatible with each datastore
+       (REST filter.datastores if supported, otherwise PBM SOAP — the same
+       source as the vSphere Client's "Storage Compatibility" tab).
+    4. Keep a policy only if EVERY host has at least one compatible datastore.
+
+    Notes on this vCenter family: REST filter.clusters / filter.datastores
+    return HTTP 400 and filter.hosts is silently ignored, so each is probed at
+    most once and abandoned on the first failure.
+    """
+    body           = request.get_json(force=True)
+    vc_url         = normalize_url(body.get("vc_url", ""))
+    username       = body.get("username", "")
+    password       = body.get("password", "")
+    cluster_moref  = body.get("cluster_moref", "")
+    cluster_morefs = body.get("cluster_morefs") or ([cluster_moref] if cluster_moref else [])
+    result         = {"policies": [], "error": None}
     try:
         token, _ = vc_auth(vc_url, username, password)
         all_policies = vc_get(vc_url, token, "/api/vcenter/storage/policies") or []
 
-        if cluster_moref:
-            # Try to get cluster's datastores; filter.clusters is unsupported on some
-            # vCenter 9 builds — fall back to listing all datastores.
-            datastores: list = []
-            for _ds_params in [{"filter.clusters": cluster_moref}, None]:
-                try:
-                    _ds = vc_get(vc_url, token, "/api/vcenter/datastore",
-                                 params=_ds_params) or []
-                    if isinstance(_ds, list) and _ds:
-                        datastores = _ds
-                        break
-                except Exception:
-                    pass
+        if not cluster_morefs:
+            result["policies"] = all_policies
+            return jsonify(result)
 
-            # Collect compat IDs using per-datastore filter
-            compat_ids: set = set()
-            ds_type_set: set = set()
-            for ds in datastores[:5]:
-                ds_id = ds.get("datastore", "")
-                if not ds_id:
+        # ── Step 1: hosts of every selected cluster (one call per cluster) ──
+        all_host_ids: list = []
+        for c_id in cluster_morefs:
+            for h in vc_get(vc_url, token, "/api/vcenter/host",
+                            params={"clusters": c_id}) or []:
+                hid = h.get("host", "")
+                if hid and hid not in all_host_ids:
+                    all_host_ids.append(hid)
+        if not all_host_ids:
+            result["policies"] = all_policies
+            return jsonify(result)
+
+        # ── Step 2: host → datastores, datastore summaries (type/capacity) ──
+        ds_summary: dict = {}      # datastore_id → summary dict from the list API
+        try:
+            for d in vc_get(vc_url, token, "/api/vcenter/datastore") or []:
+                if d.get("datastore"):
+                    ds_summary[d["datastore"]] = d
+        except Exception:
+            pass
+
+        host_ds_map: dict = {}     # host_id → set(datastore_id)
+        all_ds_ids:  set  = set()
+
+        # Preferred: REST filter.clusters (all-or-nothing; abandoned on 1st failure)
+        _tmp_map: dict = {}
+        _tmp_ds:  set  = set()
+        try:
+            for c_id in cluster_morefs:
+                _lst = vc_get(vc_url, token, "/api/vcenter/datastore",
+                              params={"filter.clusters": c_id}) or []
+                _c_ds = {d.get("datastore") for d in _lst if d.get("datastore")} \
+                    if isinstance(_lst, list) else set()
+                if not _c_ds:
                     continue
-                # Collect datastore types for exclusion heuristics
+                for d in _lst:
+                    if d.get("datastore"):
+                        ds_summary.setdefault(d["datastore"], d)
+                for h in vc_get(vc_url, token, "/api/vcenter/host",
+                                params={"clusters": c_id}) or []:
+                    if h.get("host"):
+                        _tmp_map.setdefault(h["host"], set()).update(_c_ds)
+                _tmp_ds |= _c_ds
+            host_ds_map, all_ds_ids = _tmp_map, _tmp_ds
+        except Exception:
+            pass                   # unsupported → SOAP below
+
+        # Fallback: SOAP PropertyCollector (host → datastores, exact)
+        if not all_ds_ids:
+            _soap_map = _soap_get_host_datastores(vc_url, username, password, all_host_ids)
+            if _soap_map:
+                host_ds_map = {h: set(s) for h, s in _soap_map.items()}
+                all_ds_ids  = set().union(*host_ds_map.values())
+
+        if not all_ds_ids:
+            result["policies"] = all_policies
+            return jsonify(result)
+
+        # Capacity / type for datastores missing from the list API (rare)
+        for ds_id in all_ds_ids:
+            if ds_id not in ds_summary:
                 try:
-                    ds_info = vc_get(vc_url, token, f"/api/vcenter/datastore/{ds_id}")
-                    if ds_info:
-                        ds_type_set.add(ds_info.get("type", "").upper())
-                except Exception:
-                    pass
-                try:
-                    ds_pols = vc_get(vc_url, token, "/api/vcenter/storage/policies",
-                                     params={"filter.datastores": ds_id}) or []
-                    for p in ds_pols:
-                        pid = p.get("policy", "")
-                        if pid:
-                            compat_ids.add(pid)
+                    _di = vc_get(vc_url, token, f"/api/vcenter/datastore/{ds_id}")
+                    if isinstance(_di, dict):
+                        ds_summary[ds_id] = _di
                 except Exception:
                     pass
 
-            has_vvol = "VVOL" in ds_type_set
-            has_pmem = "PMEM" in ds_type_set or "PERSISTENTMEMORY" in ds_type_set
+        def _cap(ds_id: str) -> tuple:
+            d = ds_summary.get(ds_id, {})
+            free = d.get("free_space", 0) or 0
+            return (d.get("capacity", 0) or free), free
 
-            # Try to detect stretched vSAN and ESA via vCenter vSAN API
-            is_stretched = False
-            is_esa       = False
-            for _ep in [
-                f"/api/vcenter/vsan/cluster/{cluster_moref}/config",
-                f"/api/vcenter/vsan/config/{cluster_moref}",
-            ]:
+        # ── Step 3: datastore → compatible policy ids ───────────────────────
+        ds_to_policy_ids: dict = {}
+        for ds_id in sorted(all_ds_ids):
+            try:
+                pols = vc_get(vc_url, token, "/api/vcenter/storage/policies",
+                              params={"filter.datastores": ds_id}) or []
+            except Exception:
+                break              # unsupported on this vCenter: don't hammer it
+            ds_to_policy_ids[ds_id] = {p.get("policy", "") for p in pols if p.get("policy")}
+        rest_filter_ok = any(ds_to_policy_ids.values())
+
+        pbm_used = False
+        if not rest_filter_ok:
+            _all_pids = {p.get("policy", "") for p in all_policies if p.get("policy")}
+            _pbm = _pbm_policy_ds_compat(vc_url, username, password,
+                                         sorted(_all_pids), sorted(all_ds_ids))
+            if _pbm is not None:
+                pbm_used = True
+                ds_to_policy_ids = {d: {pid for pid, dss in _pbm.items() if d in dss}
+                                    for d in all_ds_ids}
+            else:   # last resort: assume everything is compatible with everything
+                ds_to_policy_ids = {d: set(_all_pids) for d in all_ds_ids}
+
+        # ── Step 4: invert → policy → compatible datastores ─────────────────
+        policy_compat_ds: dict = {}
+        for ds_id, pol_ids in ds_to_policy_ids.items():
+            for pid in pol_ids:
+                policy_compat_ds.setdefault(pid, set()).add(ds_id)
+
+        # ── Step 5: name-based filters ──────────────────────────────────────
+        # Policies named after a cluster that is NOT selected are dropped.
+        _other_cluster_names: set = set()
+        _selected_cluster_names: set = set()
+        try:
+            for _c in vc_get(vc_url, token, "/api/vcenter/cluster") or []:
+                _cname = (_c.get("name") or "").lower().strip()
+                if not _cname:
+                    continue
+                (_selected_cluster_names if _c.get("cluster") in cluster_morefs
+                 else _other_cluster_names).add(_cname)
+        except Exception:
+            pass
+
+        # Capability heuristics (vvol / pmem / stretched / ESA in the policy
+        # name) are ALWAYS applied: PBM reports e.g. "vSAN ESA ..." or
+        # "... Stretched" policies as compatible with any vSAN datastore.
+        has_vvol = has_pmem = is_stretched = is_esa = False
+        have_real_compat = pbm_used or rest_filter_ok
+        _types = {str(ds_summary.get(d, {}).get("type", "")).upper() for d in all_ds_ids}
+        has_vvol = "VVOL" in _types
+        has_pmem = bool(_types & {"PMEM", "PERSISTENTMEMORY"})
+        _vsan_rest = True
+        for c_id in cluster_morefs:
+            if not _vsan_rest:
+                break
+            _got = False
+            for _ep in (f"/api/vcenter/vsan/cluster/{c_id}/config",
+                        f"/api/vcenter/vsan/config/{c_id}"):
                 try:
                     _cfg = vc_get(vc_url, token, _ep)
-                    if isinstance(_cfg, dict):
-                        if _cfg.get("stretched_cluster") or _cfg.get("is_stretched"):
-                            is_stretched = True
-                        _st = str(_cfg.get("storage_type", "") or "").upper()
-                        if "ESA" in _st or "EXPRESS" in _st:
-                            is_esa = True
-                        break
                 except Exception:
-                    pass
+                    continue
+                if isinstance(_cfg, dict):
+                    _got = True
+                    if _cfg.get("stretched_cluster") or _cfg.get("is_stretched"):
+                        is_stretched = True
+                    _st = str(_cfg.get("storage_type", "") or "").upper()
+                    if "ESA" in _st or "EXPRESS" in _st:
+                        is_esa = True
+                    break
+            if not _got:
+                _vsan_rest = False     # endpoints absent (404): stop probing
 
-            def _policy_applicable(p: dict) -> bool:
-                """Return False for policies that clearly cannot place VMs on this cluster."""
-                n = p.get("name", "").lower()
-                if "vvol" in n and not has_vvol:
-                    return False
-                if "pmem" in n and not has_pmem:
-                    return False
-                # "Stretched" policies need a stretched vSAN cluster
-                if "stretched" in n and not is_stretched:
-                    return False
-                # Pure ESA policies need a vSAN ESA cluster
-                # (skip if already caught by "stretched" filter above)
-                if "esa" in n and not is_esa and "stretched" not in n:
-                    return False
-                return True
+        def _policy_applicable(p: dict) -> bool:
+            n = p.get("name", "").lower()
+            if any(_ocn and _ocn in n for _ocn in _other_cluster_names):
+                return False
+            if "vvol"      in n and not has_vvol:     return False
+            if "pmem"      in n and not has_pmem:     return False
+            if "stretched" in n and not is_stretched: return False
+            if "esa"       in n and not is_esa and "stretched" not in n: return False
+            # Without real compatibility data (PBM and REST both unavailable),
+            # a policy named after one of several selected clusters is treated
+            # as cluster-specific → drop it.  With real data the all_covered
+            # check below is exact, so this rule must NOT apply.
+            if (not have_real_compat and len(cluster_morefs) > 1 and
+                    any(_scn and _scn in n for _scn in _selected_cluster_names)):
+                return False
+            return True
 
-            if compat_ids:
-                result["policies"] = [
-                    p for p in all_policies
-                    if p.get("policy", "") in compat_ids and _policy_applicable(p)
-                ]
-            else:
-                result["policies"] = [p for p in all_policies if _policy_applicable(p)]
-        else:
-            result["policies"] = all_policies
+        # ── Step 6: keep policies where EVERY host has ≥1 compatible ds ─────
+        valid_policies = []
+        for p in all_policies:
+            pid = p.get("policy", "")
+            if not pid or not _policy_applicable(p):
+                continue
+            compat_ds = policy_compat_ds.get(pid, set())
+            if not compat_ds:
+                continue
+            if all(host_ds_map.get(h_id, set()) & compat_ds for h_id in all_host_ids):
+                p_out = dict(p)
+                total_cap  = sum(_cap(d)[0] for d in compat_ds)
+                total_free = sum(_cap(d)[1] for d in compat_ds)
+                if total_cap > 0 or total_free > 0:
+                    p_out["total_capacity"] = total_cap
+                    p_out["free_space"]     = total_free
+                valid_policies.append(p_out)
+
+        result["policies"] = valid_policies
+
     except requests.HTTPError as e:
         result["error"] = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
         result["policies"] = []
@@ -1770,6 +2286,39 @@ def storage_policies_for_cluster():
         result["error"] = str(e)
         result["policies"] = []
     return jsonify(result)
+
+
+@app.route("/api/wcp-datacenter", methods=["POST"])
+def wcp_datacenter():
+    """Name of the vCenter datacenter that holds the given clusters.
+    Needed for the vCenter-native Supervisor config export (vcenterDatacenter)."""
+    body     = request.get_json(force=True)
+    vc_url   = normalize_url(body.get("vc_url", ""))
+    username = body.get("username", "")
+    password = body.get("password", "")
+    morefs   = {m for m in (body.get("cluster_morefs") or []) if m}
+    try:
+        token, _ = vc_auth(vc_url, username, password)
+        dcs = vc_get(vc_url, token, "/api/vcenter/datacenter") or []
+        name = ""
+        if len(dcs) == 1:
+            name = dcs[0].get("name", "")
+        else:
+            for dc in dcs:
+                cl = []
+                for _p in ({"datacenters": dc.get("datacenter")},
+                           {"filter.datacenters": dc.get("datacenter")}):
+                    try:
+                        cl = vc_get(vc_url, token, "/api/vcenter/cluster", params=_p) or []
+                        break
+                    except Exception:
+                        continue
+                if any(c.get("cluster") in morefs for c in cl):
+                    name = dc.get("name", "")
+                    break
+        return jsonify({"datacenter": name, "error": None})
+    except Exception as e:
+        return jsonify({"datacenter": "", "error": str(e)})
 
 
 @app.route("/api/install-supervisor", methods=["POST"])
@@ -1802,21 +2351,102 @@ def install_supervisor():
         ntp          = _list(cfg.get("ntp_servers", ""))
         domains      = _list(cfg.get("search_domains", ""))
 
-        # zone_id is the proper vSphere Zone ID (vCenter 8.x / VCF 5.x).
-        # Fall back to cluster_moref for older environments without zones.
-        _zone_ref = cfg.get("zone_id") or cfg.get("cluster_moref", "")
+        # ── Zone resolution: create zones if clusters are not yet in a zone ──────
+        # Case A: pre-existing zones explicitly selected (selected_zones list)
+        _placement_mode = cfg.get("placement_mode", "multiple")
+        if cfg.get("selected_zones") and len(cfg["selected_zones"]) > 0:
+            _zones = cfg["selected_zones"]
+
+        # Case B: clusters NOT yet in a zone → create zones + associate, then deploy
+        elif not cfg.get("zone_id") and cfg.get("selected_clusters"):
+            _sel_clusters = cfg["selected_clusters"]
+            _zone_prefix  = (cfg.get("zone_prefix") or "tool-zone").strip() or "tool-zone"
+
+            if _placement_mode == "multiple":
+                # One zone per cluster (HA across zones)
+                _zones = []
+                for _i, _sc in enumerate(_sel_clusters, 1):
+                    _cmoref    = _sc["cluster"] if isinstance(_sc, dict) else _sc
+                    _zone_name = f"{_zone_prefix}{_i}"
+                    # 1. Create zone
+                    _zr = SESS.post(
+                        f"{vc_url}/api/vcenter/consumption-domains/zones",
+                        headers={"vmware-api-session-id": token,
+                                 "Content-Type": "application/json"},
+                        json={"zone": _zone_name},
+                        verify=False, timeout=30,
+                    )
+                    if not _zr.ok:
+                        raise ValueError(
+                            f"Failed to create zone '{_zone_name}': "
+                            f"HTTP {_zr.status_code}: {_zr.text[:300]}"
+                        )
+                    _zid = _zone_name   # zone name IS the zone identifier
+                    # 2. Associate cluster → zone via vapi JSON-RPC
+                    _vapi_zone_cluster_add(vc_url, token, _zone_name, _cmoref)
+                    _zones.append(_zid)
+            else:
+                # single_specific / single_least: one shared zone, all clusters in it
+                _zone_name = f"{_zone_prefix}1"
+                _zr = SESS.post(
+                    f"{vc_url}/api/vcenter/consumption-domains/zones",
+                    headers={"vmware-api-session-id": token,
+                             "Content-Type": "application/json"},
+                    json={"zone": _zone_name},
+                    verify=False, timeout=30,
+                )
+                if not _zr.ok:
+                    raise ValueError(
+                        f"Failed to create zone '{_zone_name}': "
+                        f"HTTP {_zr.status_code}: {_zr.text[:300]}"
+                    )
+                _zid = _zone_name   # zone name IS the zone identifier
+                # Associate each cluster → zone via vapi JSON-RPC
+                for _sc in _sel_clusters:
+                    _cmoref = _sc["cluster"] if isinstance(_sc, dict) else _sc
+                    _vapi_zone_cluster_add(vc_url, token, _zone_name, _cmoref)
+                _zones = [_zid]
+
+        # Case C: single pre-existing zone_id
+        elif cfg.get("zone_id"):
+            _zones = [cfg["zone_id"]]
+
+        # Case D: last-resort fallback (single-cluster legacy path)
+        else:
+            _zones = [cfg.get("cluster_moref", "")]
+
+        # ── Management network backing ──────────────────────────────────────
+        # Each selected cluster may have its OWN port group (e.g. one VDS per
+        # cluster, all on the same VLAN).  A single NETWORK backing would have
+        # to exist in every zone ("No portgroup backing given Network Segment
+        # dvportgroup-N is available on any cluster in the zone ...").  The
+        # API (8.0.3+) accepts a NETWORK_SEGMENT = list of port groups that are
+        # part of the same layer-2 broadcast domain, one per cluster.
+        _cpg_map = cfg.get("cluster_port_groups") or {}
+        _sel_c = {(_c["cluster"] if isinstance(_c, dict) else _c)
+                  for _c in (cfg.get("selected_clusters") or [])}
+        if cfg.get("cluster_moref"):
+            _sel_c.add(cfg["cluster_moref"])
+        _pg_list: list = []
+        for _pg in [cfg.get("port_group_id")] + [
+                _v for _k, _v in _cpg_map.items() if not _sel_c or _k in _sel_c]:
+            if _pg and _pg not in _pg_list:
+                _pg_list.append(_pg)
+        if len(_pg_list) > 1:
+            _mgmt_backing = {"backing": "NETWORK_SEGMENT",
+                             "network_segment": {"networks": _pg_list}}
+        else:
+            _mgmt_backing = {"backing": "NETWORK", "network": cfg["port_group_id"]}
 
         spec = {
             "name": cfg["name"],
-            "zones": [_zone_ref],
+            "zones": _zones,
             "control_plane": {
                 "size": cfg.get("size", "SMALL"),
-                "storage_policy": cfg["storage_policy_uuid"],
+                "cpvmCount": 3 if cfg.get("ha_mode", True) else 1,
+                "storage_policy": cfg.get("ctrl_plane_policy_uuid") or cfg["storage_policy_uuid"],
                 "network": {
-                    "backing": {
-                        "backing": "NETWORK",
-                        "network": cfg["port_group_id"],
-                    },
+                    "backing": _mgmt_backing,
                     "services": {
                         "dns": {"servers": dns_mgmt, "search_domains": domains},
                         "ntp": {"servers": ntp},
@@ -1844,7 +2474,8 @@ def install_supervisor():
                             "vpc_connectivity_profile_path",
                             "/orgs/default/projects/default/vpc-connectivity-profiles/default",
                         ),
-                        "default_private_cidrs": [{"address": "172.30.0.0", "prefix": 16}],
+                        "default_private_cidrs": [{"address": cfg.get("private_workload_cidr", "172.30.0.0/16").split("/")[0],
+                                                    "prefix": int(cfg.get("private_workload_cidr", "172.30.0.0/16").split("/")[-1])}],
                     },
                     "services": {
                         "dns": {"servers": dns_workload, "search_domains": domains},
@@ -1855,15 +2486,16 @@ def install_supervisor():
                         "ip_assignments": [
                             {
                                 "assignee": "SERVICE",
-                                "ranges": [{"address": "10.96.0.0", "count": 1048576}],
+                                "ranges": [{"address": cfg.get("service_cidr", "10.96.0.0/12").split("/")[0],
+                                            "count": 2 ** (32 - int(cfg.get("service_cidr", "10.96.0.0/12").split("/")[-1]))}],
                             }
                         ],
                     },
                 },
                 "edge": {"provider": "NSX", "nsx": {"routing_mode": "NO_NAT"}},
                 "storage": {
-                    "ephemeral_storage_policy": cfg["storage_policy_uuid"],
-                    "image_storage_policy": cfg["storage_policy_uuid"],
+                    "ephemeral_storage_policy": cfg.get("ephemeral_policy_uuid") or cfg["storage_policy_uuid"],
+                    "image_storage_policy":     cfg.get("image_cache_policy_uuid") or cfg["storage_policy_uuid"],
                 },
             },
         }
@@ -2856,8 +3488,13 @@ def fix_vna_options():
         "vc_dns": [], "vc_ntp": [],
         "domain": "", "compute_manager_id": None,
         # auto-discovered NSX fields
-        "overlay_tz_path": None,
-        "vm_mgmt_dvpg":    None,
+        "overlay_tz_path":  None,
+        "vm_mgmt_dvpg":     None,
+        "vm_cluster_moref": None,
+        "vm_datastore_id":  None,
+        # cascading-dropdown maps
+        "pg_clusters_map":  {},   # pg_moref  → [cluster_moref, ...]
+        "cluster_ds_map":   {},   # cluster_moref → [datastore_moref, ...]
     }
     try:
         token, _ = vc_auth(vc_url, username, password)
@@ -2869,6 +3506,37 @@ def fix_vna_options():
         ds_raw = vc_get(vc_url, token, "/api/vcenter/datastore") or []
         result["datastores"] = sorted(ds_raw,
                                       key=lambda d: d.get("free_space", 0), reverse=True)
+
+        # ── Cascading-dropdown maps ────────────────────────────────────────
+        # NOTE: GET /api/vcenter/network?hosts= and ?clusters= filters are silently
+        # ignored in some vCenter versions (all portgroups returned regardless).
+        # Use SOAP PropertyCollector to accurately map PGs → clusters via the
+        # DVS membership chain: DVPG → parent DVS → connected hosts → cluster.
+
+        # 1. pg_clusters_map: portgroup moref → [cluster morefs] via SOAP
+        result["pg_clusters_map"] = _vc_soap_get_pg_cluster_map(vc_url, username, password)
+
+        # 2. cluster_ds_map still uses REST (datastore filter is reliable enough)
+        # 3. cluster_ds_map: cluster moref → [datastore morefs] (use per-cluster hosts)
+        try:
+            _cdm: dict = {}
+            for _c in result["clusters"]:
+                _cm = _c.get("cluster", "")
+                if not _cm:
+                    continue
+                _hs = vc_get(vc_url, token, "/api/vcenter/host",
+                             params={"clusters": _cm}) or []
+                if _hs:
+                    _hid = _hs[0].get("host", "")
+                    _dsl = vc_get(vc_url, token, "/api/vcenter/datastore",
+                                  params={"hosts": _hid}) or []
+                    _cdm[_cm] = [_d.get("datastore", "") for _d in _dsl
+                                 if _d.get("datastore")]
+            result["cluster_ds_map"] = _cdm
+        except Exception:
+            pass
+
+        # cluster_ds_map is built above via per-host queries.
 
         _vc_own_ip = ""   # stored for VM-lookup fallback below
         try:
@@ -2930,6 +3598,8 @@ def fix_vna_options():
 
             if _vc_vm:
                 _vm_id = _vc_vm.get("vm", "")
+
+                # ── Port group from first NIC ──────────────────────────────
                 _nics  = (vc_get(vc_url, token,
                                  f"/api/vcenter/vm/{_vm_id}/hardware/ethernet")
                           or []) if _vm_id else []
@@ -2941,6 +3611,42 @@ def fix_vna_options():
                     _pg = ((_nic_data or {}).get("backing") or {}).get("network", "")
                     if _pg:
                         result["vm_mgmt_dvpg"] = _pg
+
+                # ── Cluster: iterate clusters, find which one contains the vCenter VM ──
+                if _vm_id:
+                    for _c in result.get("clusters", []):
+                        _cmoref = _c.get("cluster", "")
+                        if not _cmoref:
+                            continue
+                        _vms_in_c = vc_get(vc_url, token, "/api/vcenter/vm",
+                                           params={"clusters": _cmoref}) or []
+                        if any(v.get("vm") == _vm_id for v in _vms_in_c):
+                            result["vm_cluster_moref"] = _cmoref
+                            break
+
+                # ── Datastore: read from the VM's actual disk backing ─────────────
+                # The VM's boot disk path includes the datastore name,
+                # e.g. "[vsan-mgmt-01a] vc-mgmt-a/vc-mgmt-a.vmdk"
+                if _vm_id:
+                    try:
+                        _disks = vc_get(vc_url, token,
+                                        f"/api/vcenter/vm/{_vm_id}/hardware/disk") or []
+                        if _disks:
+                            _disk0_id = _disks[0].get("disk", "")
+                            if _disk0_id:
+                                _dd = vc_get(vc_url, token,
+                                             f"/api/vcenter/vm/{_vm_id}/hardware/disk/{_disk0_id}") or {}
+                                _vmdk = (_dd.get("backing") or {}).get("vmdk_file", "")
+                                # Extract datastore name from "[ds-name] path/file.vmdk"
+                                if _vmdk and "[" in _vmdk:
+                                    _ds_name = _vmdk.split("[")[1].split("]")[0].strip()
+                                    # Match by name in the datastores list
+                                    for _ds in result.get("datastores", []):
+                                        if _ds.get("name") == _ds_name:
+                                            result["vm_datastore_id"] = _ds.get("datastore", "")
+                                            break
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -3099,6 +3805,7 @@ def fix_create_vna():
     ntp_list  = body.get("ntp", [])
     domain    = body.get("domain", "local")
     form_factor = body.get("form_factor", "MEDIUM")
+    ip_mode   = body.get("ip_mode", "static")
 
     result = {"success": False, "error": None}
     base  = ("/policy/api/v1/infra/sites/default/enforcement-points/default"
@@ -3172,6 +3879,17 @@ def fix_create_vna():
         # ── Step 2: create each node ──────────────────────────────────────
         for i, ip in enumerate([ip1, ip2]):
             node_id = f"vna-node-{i + 1}"
+            # Build ip_assignment_specs based on mode
+            if ip_mode == "dhcp":
+                ip_specs = [{"ip_assignment_type": "Dhcpv4"}]
+            else:
+                ip_specs = [{
+                    "management_port_subnets": [
+                        {"ip_addresses": [ip], "prefix_length": prefix}
+                    ],
+                    "default_gateway":    [gateway],
+                    "ip_assignment_type": "StaticIpv4",
+                }]
             node_payload = {
                 "resource_type":     "VirtualNetworkAppliance",
                 "id":                node_id,
@@ -3188,13 +3906,7 @@ def fix_create_vna():
                     },
                 },
                 "management_interface": {
-                    "ip_assignment_specs": [{
-                        "management_port_subnets": [
-                            {"ip_addresses": [ip], "prefix_length": prefix}
-                        ],
-                        "default_gateway":    [gateway],
-                        "ip_assignment_type": "StaticIpv4",
-                    }],
+                    "ip_assignment_specs": ip_specs,
                     "network_id": port_group_id,
                 },
                 "credentials": {
@@ -3925,6 +4637,127 @@ def fix_configure_vpc_profile():
 
 # ── vCenter SOAP helpers for SSH service management ──────────────────────────
 
+def _soap_get_host_datastores(vc_url, vc_user, vc_pass, host_morefs):
+    """Get {host_moref: set(datastore_morefs)} via SOAP PropertyCollector.
+
+    Used as fallback when REST GET /api/vcenter/datastore?filter.hosts is not supported
+    (returns HTTP 400 on some vCenter versions including vCenter 9.1).
+    """
+    import re as _re
+    if not host_morefs:
+        return {}
+    result: dict = {}
+    try:
+        s, ep, hdr = _soap_session(vc_url, vc_user, vc_pass)
+        obj_set = "".join(
+            f"<objectSet><obj type=\"HostSystem\">{h}</obj></objectSet>"
+            for h in host_morefs
+        )
+        r = s.post(ep, verify=False, timeout=30, headers=hdr, data=(
+            '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
+            '<Body><RetrieveProperties xmlns="urn:vim25">'
+            '<_this type="PropertyCollector">propertyCollector</_this>'
+            "<specSet>"
+            "<propSet><type>HostSystem</type><all>false</all>"
+            "<pathSet>datastore</pathSet>"
+            "</propSet>"
+            + obj_set
+            + "</specSet>"
+            "</RetrieveProperties></Body></Envelope>"
+        ))
+        if r.status_code != 200 or "Fault" in r.text:
+            return result
+        for block in _re.findall(r"<returnval>(.*?)</returnval>", r.text, _re.S):
+            host_m = _re.search(r'<obj type="HostSystem">([^<]+)</obj>', block)
+            # vCenter encodes datastore array as ManagedObjectReference elements
+            ds_ids = _re.findall(r"<ManagedObjectReference[^>]*>([^<]+)</ManagedObjectReference>", block)
+            if not ds_ids:
+                # Alternate: <val ...>datastore-NNN</val> or naked text matching datastore-NNN
+                ds_ids = _re.findall(r">(datastore-\d+)<", block)
+            if host_m and ds_ids:
+                result[host_m.group(1)] = set(ds_ids)
+    except Exception:
+        pass
+    return result
+
+
+_PBM_CACHE: dict = {}          # (vc, user, policies, datastores) → (timestamp, result)
+_PBM_CACHE_TTL = 120           # seconds
+
+
+def _pbm_policy_ds_compat(vc_url, vc_user, vc_pass, policy_ids, ds_ids):
+    """Real storage-policy / datastore compatibility via the PBM SOAP API
+    (same source the vSphere Client uses for the 'Storage Compatibility' tab).
+
+    Needed because REST /api/vcenter/storage/policies?filter.datastores is
+    unsupported on some vCenter versions (HTTP 400).
+
+    Returns {policy_id: set(compatible datastore ids)}, or None if PBM is
+    unusable (login failure, every call failed, ...).
+    Auth notes (learned the hard way): PBM needs BOTH the vmware_soap_session
+    cookie AND a <vcSessionCookie> SOAP header; the parameter is named
+    'hubsToSearch' (not hubList) and PbmProfileId uses <uniqueId>.
+    """
+    import re as _re
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    if not policy_ids or not ds_ids:
+        return None
+    _ck = (vc_url, vc_user, tuple(policy_ids), tuple(ds_ids))
+    _hit = _PBM_CACHE.get(_ck)
+    if _hit and _time.time() - _hit[0] < _PBM_CACHE_TTL:
+        return {k: set(v) for k, v in _hit[1].items()}
+    try:
+        s, _ep, _hdr = _soap_session(vc_url, vc_user, vc_pass)
+        key = ""
+        for c in s.cookies:
+            if c.name == "vmware_soap_session":
+                key = c.value.strip('"')
+        if not key:
+            return None
+        pbm_ep  = f"{vc_url}/pbm/sdk"
+        pbm_hdr = {"Content-Type": "text/xml; charset=UTF-8",
+                   "SOAPAction": "urn:pbm/version2",
+                   "Cookie": f'vmware_soap_session="{key}"'}
+        hubs = "".join(
+            f"<hubsToSearch><hubType>Datastore</hubType><hubId>{d}</hubId></hubsToSearch>"
+            for d in ds_ids)
+        def _check(pid):
+            body = (
+                '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">'
+                f'<soapenv:Header><vcSessionCookie xmlns="urn:vim25">{key}</vcSessionCookie></soapenv:Header>'
+                "<soapenv:Body>"
+                '<PbmCheckCompatibility xmlns="urn:pbm">'
+                '<_this type="PbmPlacementSolver">placementSolver</_this>'
+                + hubs +
+                f"<profile><uniqueId>{pid}</uniqueId></profile>"
+                "</PbmCheckCompatibility></soapenv:Body></soapenv:Envelope>")
+            try:
+                r = s.post(pbm_ep, verify=False, timeout=30, headers=pbm_hdr, data=body)
+            except Exception:
+                return pid, None
+            if r.status_code != 200 or "Fault" in r.text[:600]:
+                return pid, None
+            compat: set = set()
+            for blk in _re.findall(r"<returnval>(.*?)</returnval>", r.text, _re.S):
+                m = _re.search(r"<hubId>([^<]+)</hubId>", blk)
+                # incompatible hubs carry an <error ...> element (with attributes)
+                if m and not _re.search(r"<error[\s>]", blk):
+                    compat.add(m.group(1).strip())
+            return pid, compat
+
+        # Independent per-policy calls → run in parallel
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            outcomes = list(ex.map(_check, policy_ids))
+        result = {pid: c for pid, c in outcomes if c is not None}
+        if not result:
+            return None
+        _PBM_CACHE[_ck] = (_time.time(), {k: set(v) for k, v in result.items()})
+        return result
+    except Exception:
+        return None
+
+
 def _soap_get_cluster_ha_drs(vc_url, vc_user, vc_pass, cluster_morefs):
     """
     Fetch accurate HA and DRS settings for vSphere clusters via SOAP.
@@ -4430,8 +5263,8 @@ def check_mtu():
                     try:
                         _, stdout, _ = ssh.exec_command(cmd, timeout=12)
                         out = stdout.read().decode("utf-8", errors="replace")
-                        ok  = ("0% packet loss" in out or
-                               "0.0% packet loss" in out)
+                        ok  = (", 0% packet loss" in out or
+                               ", 0.0% packet loss" in out)
                         lat = ""
                         for line in out.splitlines():
                             m = _re.search(r"time=(\S+)", line)
@@ -4514,256 +5347,6 @@ def _pick_temp_ips(cidr, gateway_cidr, excluded_str, count):
         if len(result) >= count:
             break
     return result
-
-
-def _vc_soap_login(vc_url, vc_user, vc_pass):
-    """Create an authenticated vCenter SOAP session. Returns (session, endpoint, headers)."""
-    s = requests.Session()
-    ep  = f"https://{vc_url}/sdk"
-    hdr = {"Content-Type": "text/xml", "SOAPAction": "urn:vim25/6.7"}
-    r = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><Login xmlns="urn:vim25">'
-        '<_this type="SessionManager">SessionManager</_this>'
-        f'<userName>{vc_user}</userName><password>{vc_pass}</password>'
-        '</Login></Body></Envelope>'))
-    if "LoginResponse" not in r.text:
-        raise RuntimeError(f"vCenter login failed: {r.text[:200]}")
-    return s, ep, hdr
-
-
-def _vc_soap_find_host(s, ep, hdr, fqdn):
-    """Find host MOR by FQDN using SearchIndex."""
-    import re as _re
-    r = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><FindByDnsName xmlns="urn:vim25">'
-        '<_this type="SearchIndex">SearchIndex</_this>'
-        f'<dnsName>{fqdn}</dnsName><vmSearch>false</vmSearch>'
-        '</FindByDnsName></Body></Envelope>'))
-    m = _re.search(r'<returnval type="HostSystem">([^<]+)</returnval>', r.text)
-    return m.group(1).strip() if m else None
-
-
-def _vc_soap_get_netsys_and_dvs(s, ep, hdr, host_moref):
-    """Return (netsys_moref, []) for a host.
-    The DVS list is no longer derived from the host (networkInfo.proxySwitch is gone
-    in vCenter 9); DVS lookup is done separately via _vc_soap_find_dvs_by_name."""
-    import re as _re
-    r = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><RetrieveProperties xmlns="urn:vim25">'
-        '<_this type="PropertyCollector">propertyCollector</_this>'
-        '<specSet><propSet><type>HostSystem</type><all>false</all>'
-        '<pathSet>configManager.networkSystem</pathSet></propSet>'
-        f'<objectSet><obj type="HostSystem">{host_moref}</obj></objectSet>'
-        '</specSet></RetrieveProperties></Body></Envelope>'))
-    # vCenter 9 returns <val xsi:type="ManagedObjectReference" type="HostNetworkSystem">
-    ns_m = _re.search(r'<val[^>]*type="HostNetworkSystem"[^>]*>([^<]+)</val>', r.text)
-    if not ns_m:
-        return None, []
-    return ns_m.group(1).strip(), []
-
-
-def _vc_soap_find_dvs_by_name(s, ep, hdr, dvs_name):
-    """Find a DVS MOR and UUID by display name.
-    Returns (dvs_mor, dvs_uuid) or (None, None).
-    Tries VmwareDistributedVirtualSwitch first (VCF/NSX uses this concrete type),
-    then falls back to the generic DistributedVirtualSwitch."""
-    import re as _re
-
-    def _scan(dvs_type):
-        r = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-            '<Body><CreateContainerView xmlns="urn:vim25">'
-            '<_this type="ViewManager">ViewManager</_this>'
-            '<container type="Folder">group-d1</container>'
-            f'<type>{dvs_type}</type>'
-            '<recursive>true</recursive>'
-            '</CreateContainerView></Body></Envelope>'))
-        cv_m = _re.search(r'<returnval type="ContainerView">([^<]+)</returnval>', r.text)
-        if not cv_m:
-            return None, None
-        cv = cv_m.group(1)
-        # Retrieve both 'name' and 'uuid' for every DVS in one call
-        r2 = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-            '<Body><RetrieveProperties xmlns="urn:vim25">'
-            '<_this type="PropertyCollector">propertyCollector</_this>'
-            f'<specSet>'
-            f'<propSet><type>{dvs_type}</type><all>false</all><pathSet>name</pathSet></propSet>'
-            f'<propSet><type>{dvs_type}</type><all>false</all><pathSet>uuid</pathSet></propSet>'
-            f'<objectSet><obj type="ContainerView">{cv}</obj>'
-            '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="TraversalSpec">'
-            '<type>ContainerView</type><path>view</path></selectSet>'
-            '</objectSet></specSet></RetrieveProperties></Body></Envelope>'))
-        # Build a map: mor → {name, uuid}
-        dvs_map: dict = {}
-        pat_obj = rf'<obj type="{_re.escape(dvs_type)}">([^<]+)</obj>'
-        pat_prop = r'<propSet><name>([^<]+)</name><val[^>]*>([^<]+)</val></propSet>'
-        # Split returnval blocks
-        for block in _re.finditer(
-                rf'<returnval>(<obj type="{_re.escape(dvs_type)}">[^<]+</obj>.*?)</returnval>',
-                r2.text, _re.DOTALL):
-            chunk = block.group(1)
-            m_obj = _re.search(pat_obj, chunk)
-            if not m_obj:
-                continue
-            mor = m_obj.group(1).strip()
-            dvs_map.setdefault(mor, {})
-            for pm in _re.finditer(pat_prop, chunk):
-                dvs_map[mor][pm.group(1)] = pm.group(2).strip()
-        for mor, props in dvs_map.items():
-            if props.get("name", "").lower() == dvs_name.lower():
-                return mor, props.get("uuid", "")
-        return None, None
-
-    mor, uid = _scan("VmwareDistributedVirtualSwitch")
-    if mor:
-        return mor, uid
-    return _scan("DistributedVirtualSwitch")
-
-
-# Keep legacy name as alias (still called in a couple places)
-def _vc_soap_find_dvs(s, ep, hdr, dvs_uuid_or_name):
-    mor, _ = _vc_soap_find_dvs_by_name(s, ep, hdr, dvs_uuid_or_name)
-    return mor
-
-
-def _vc_soap_ensure_dvpg(s, ep, hdr, dvs_moref, pg_name, vlan_id):
-    """Create (or find existing) DVPortGroup with given VLAN. Returns (dvpg_moref, created_by_us)."""
-    import re as _re, time as _time
-    create_body = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><AddDVPortgroup_Task xmlns="urn:vim25">'
-        f'<_this type="DistributedVirtualSwitch">{dvs_moref}</_this>'
-        '<spec>'
-        f'<name>{pg_name}</name><type>earlyBinding</type><numPorts>16</numPorts>'
-        '<defaultPortConfig>'
-        '<vlan xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
-        ' xsi:type="VmwareDistributedVirtualSwitchVlanIdSpec">'
-        f'<inherited>false</inherited><vlanId>{vlan_id}</vlanId>'
-        '</vlan></defaultPortConfig>'
-        '</spec>'
-        '</AddDVPortgroup_Task></Body></Envelope>')
-    r = s.post(ep, verify=False, timeout=30, headers=hdr, data=create_body)
-    task_m = _re.search(r'<returnval type="Task">([^<]+)</returnval>', r.text)
-    if task_m:
-        task = task_m.group(1)
-        for _ in range(30):
-            _time.sleep(1)
-            rt = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-                '<Body><RetrieveProperties xmlns="urn:vim25">'
-                '<_this type="PropertyCollector">propertyCollector</_this>'
-                '<specSet><propSet><type>Task</type><all>false</all>'
-                '<pathSet>info.state</pathSet><pathSet>info.result</pathSet>'
-                '<pathSet>info.error</pathSet></propSet>'
-                f'<objectSet><obj type="Task">{task}</obj></objectSet>'
-                '</specSet></RetrieveProperties></Body></Envelope>'))
-            st = _re.search(r'<val>(\w+)</val>', rt.text)
-            state = st.group(1) if st else 'unknown'
-            if state == 'success':
-                res_m = _re.search(
-                    r'<val type="DistributedVirtualPortgroup">([^<]+)</val>', rt.text)
-                if res_m:
-                    return res_m.group(1).strip(), True
-                break
-            elif state == 'error':
-                em = _re.search(r'<localizedMessage>([^<]+)</localizedMessage>', rt.text)
-                raise RuntimeError(f"DVPortGroup creation failed: {em.group(1) if em else rt.text[:300]}")
-    # If task missing or result not found: find existing portgroup by name
-    r3 = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><RetrieveProperties xmlns="urn:vim25">'
-        '<_this type="PropertyCollector">propertyCollector</_this>'
-        '<specSet><propSet><type>DistributedVirtualPortgroup</type><all>false</all>'
-        '<pathSet>name</pathSet></propSet>'
-        f'<objectSet><obj type="DistributedVirtualSwitch">{dvs_moref}</obj>'
-        '<selectSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="TraversalSpec">'
-        '<type>DistributedVirtualSwitch</type><path>portgroup</path></selectSet>'
-        '</objectSet></specSet></RetrieveProperties></Body></Envelope>'))
-    # <val> may carry xsi:type attribute → use [^>]* to match any attrs
-    for m in _re.finditer(
-            r'<obj type="DistributedVirtualPortgroup">([^<]+)</obj>.*?<val[^>]*>([^<]+)</val>',
-            r3.text, _re.DOTALL):
-        if m.group(2).strip() == pg_name:
-            return m.group(1).strip(), False
-    raise RuntimeError(f"Could not create or locate DVPortGroup '{pg_name}'")
-
-
-def _vc_soap_get_dvpg_key(s, ep, hdr, dvpg_moref):
-    """Get the DVPortGroup's portgroup key."""
-    import re as _re
-    r = s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><RetrieveProperties xmlns="urn:vim25">'
-        '<_this type="PropertyCollector">propertyCollector</_this>'
-        '<specSet><propSet><type>DistributedVirtualPortgroup</type><all>false</all>'
-        '<pathSet>key</pathSet></propSet>'
-        f'<objectSet><obj type="DistributedVirtualPortgroup">{dvpg_moref}</obj></objectSet>'
-        '</specSet></RetrieveProperties></Body></Envelope>'))
-    # <val> may carry xsi:type attribute → use [^>]* to match any attrs
-    m = _re.search(r'<val[^>]*>([^<]+)</val>', r.text)
-    return m.group(1).strip() if m else None
-
-
-def _vc_soap_add_vmk(s, ep, hdr, netsys_moref, dvs_uuid, dvpg_key, ip_str, prefix_len):
-    """Add a VMkernel NIC on a DVPortGroup. Returns device name (e.g. 'vmk5')."""
-    import re as _re, ipaddress as _ip
-    mask = str(_ip.IPv4Network(f"0.0.0.0/{prefix_len}").netmask)
-    r = s.post(ep, verify=False, timeout=30, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><AddVirtualNic xmlns="urn:vim25">'
-        f'<_this type="HostNetworkSystem">{netsys_moref}</_this>'
-        '<portgroup></portgroup>'
-        '<nic>'
-        '<distributedVirtualPort>'
-        f'<switchUuid>{dvs_uuid}</switchUuid>'
-        f'<portgroupKey>{dvpg_key}</portgroupKey>'
-        '</distributedVirtualPort>'
-        '<ip><dhcp>false</dhcp>'
-        f'<ipAddress>{ip_str}</ipAddress>'
-        f'<subnetMask>{mask}</subnetMask>'
-        '</ip>'
-        '</nic>'
-        '</AddVirtualNic></Body></Envelope>'))
-    m = _re.search(r'<returnval>([^<]+)</returnval>', r.text)
-    if m:
-        return m.group(1).strip()
-    fm = _re.search(r'<faultstring>([^<]+)</faultstring>', r.text)
-    raise RuntimeError(fm.group(1) if fm else f"AddVirtualNic failed: {r.text[:300]}")
-
-
-def _vc_soap_remove_vmk(s, ep, hdr, netsys_moref, device):
-    """Remove a VMkernel NIC."""
-    s.post(ep, verify=False, timeout=15, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><RemoveVirtualNic xmlns="urn:vim25">'
-        f'<_this type="HostNetworkSystem">{netsys_moref}</_this>'
-        f'<device>{device}</device>'
-        '</RemoveVirtualNic></Body></Envelope>'))
-
-
-def _vc_soap_destroy_dvpg(s, ep, hdr, dvpg_moref):
-    """Destroy a DVPortGroup (best-effort)."""
-    s.post(ep, verify=False, timeout=30, headers=hdr, data=(
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">'
-        '<Body><Destroy_Task xmlns="urn:vim25">'
-        f'<_this type="DistributedVirtualPortgroup">{dvpg_moref}</_this>'
-        '</Destroy_Task></Body></Envelope>'))
 
 
 def _pcli_setup_vlan_test(vc_url, vc_user, vc_pass, vds_name, pg_name, vlan_id, host_ips,
@@ -4893,66 +5476,6 @@ def _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, host_fqdns):
 # ──────────────────────────────────────────────────────────────────────────────
 # DNS Connectivity Check  (Deploy Wizard — Step 2 Network)
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _pcli_dns_vmk_create(vc_url, vc_user, vc_pass, pg_name, host_fqdn, ip, prefix):
-    """PowerCLI: create a temp vmk on an existing DVPortGroup for the DNS check.
-    Pre-cleans any stale vmk with the same IP before creating.
-    Returns (vmk_name, vlan_id, error_str)."""
-    import subprocess, tempfile, textwrap, re as _re, os
-    vc_host = vc_url.replace("https://","").replace("http://","").rstrip("/")
-    import ipaddress as _ipmod
-    netmask = str(_ipmod.IPv4Network(f"0.0.0.0/{prefix}").netmask)
-    script = textwrap.dedent(f"""\
-        $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
-        $ErrorActionPreference = 'SilentlyContinue'
-        Set-PowerCLIConfiguration -Scope Session -ParticipateInCEIP $false -Confirm:$false | Out-Null
-        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
-        $ErrorActionPreference = 'Stop'
-        Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' -Force | Out-Null
-        $vmhost  = Get-VMHost -Name '{host_fqdn}'
-        # Pre-flight: remove any stale vmk with the same IP (from a previous failed cleanup)
-        $ErrorActionPreference = 'SilentlyContinue'
-        $stale = Get-VMHostNetworkAdapter -VMHost $vmhost | Where-Object {{ $_.IP -eq '{ip}' }}
-        if ($stale) {{
-            Write-Host "PRE_CLEAN:$($stale.Name)"
-            Remove-VMHostNetworkAdapter -NetworkAdapter $stale -Confirm:$false
-            Start-Sleep -Seconds 3
-        }}
-        $ErrorActionPreference = 'Stop'
-        $pg      = Get-VDPortgroup -Name '{pg_name}' | Select-Object -First 1
-        $vds     = $pg.VDSwitch
-        $vlanCfg = $pg.VlanConfiguration
-        $vlanId  = if ($vlanCfg -ne $null -and $vlanCfg.VlanId -ne $null) {{ $vlanCfg.VlanId }} else {{ 0 }}
-        Write-Host "VLAN_ID:$vlanId"
-        $vmk = New-VMHostNetworkAdapter -VMHost $vmhost -VirtualSwitch $vds -PortGroup $pg -IP '{ip}' -SubnetMask '{netmask}'
-        Write-Host "VMK_NAME:$($vmk.Name)"
-        Disconnect-VIServer -Confirm:$false | Out-Null
-        Write-Host "DNS_SETUP_DONE"
-    """)
-    with tempfile.NamedTemporaryFile(suffix=".ps1", mode="w", delete=False, prefix="dns_setup_") as f:
-        f.write(script); script_path = f.name
-    try:
-        env = os.environ.copy()
-        env["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1"
-        env.setdefault("HOME", "/root")
-        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", script_path],
-                           capture_output=True, text=True, timeout=120, env=env)
-        out = _re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', r.stdout + r.stderr)
-        if "DNS_SETUP_DONE" not in out:
-            return None, None, f"PowerCLI vmk create failed:\n{out[:1500]}"
-        vmk_name = None; vlan_id = 0
-        for line in out.splitlines():
-            if line.startswith("VMK_NAME:"): vmk_name = line.split(":",1)[1].strip()
-            if line.startswith("VLAN_ID:"):
-                try: vlan_id = int(line.split(":",1)[1].strip())
-                except: vlan_id = 0
-        return vmk_name, vlan_id, ""
-    except subprocess.TimeoutExpired:
-        return None, None, "PowerCLI timed out (>120s)"
-    finally:
-        try: os.unlink(script_path)
-        except Exception: pass
-
 
 def _pcli_vmk_on_stack(vc_url, vc_user, vc_pass, host_name, pg_name, stack_name,
                         create_pg=False, vds_name=None, vlan_id=None, ip_to_exclude=None):
@@ -5107,70 +5630,6 @@ def _pcli_dns_vmk_remove(vc_url, vc_user, vc_pass, host_fqdn, vmk_name, ip=""):
         except Exception: pass
 
 
-def _pcli_setup_wld_vmk_dedicated_stack(vc_url, vc_user, vc_pass,
-                                          host_name, vds_name, pg_name, vlan_id,
-                                          ip, mask, stack_name):
-    """
-    Create DVPortGroup + vmk using New-VMHostNetworkAdapter (proven approach).
-    The vmk lands on the Default TCP/IP stack; correct routing is achieved by
-    the caller adding a temporary host route via SSH.
-    Returns (vmk_name, error_str).
-    """
-    import subprocess, tempfile, os, textwrap
-    vc_host = vc_url.replace("https://","").replace("http://","").rstrip("/")
-    script = textwrap.dedent(f"""\
-        Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
-        Connect-VIServer -Server '{vc_host}' -User '{vc_user}' -Password '{vc_pass}' | Out-Null
-
-        $vmhost = Get-VMHost -Name '{host_name}' -ErrorAction SilentlyContinue
-        if (-not $vmhost) {{ Write-Host 'ERROR:VMHOST_NOT_FOUND'; exit }}
-        $vds = Get-VDSwitch -Name '{vds_name}' -ErrorAction SilentlyContinue
-        if (-not $vds) {{ Write-Host 'ERROR:VDS_NOT_FOUND'; exit }}
-
-        # Remove any stale portgroup + its vmks
-        $old = Get-VDPortgroup -Name '{pg_name}' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($old) {{
-            Get-VMHostNetworkAdapter -PortGroup $old -ErrorAction SilentlyContinue |
-                Remove-VMHostNetworkAdapter -Confirm:$false -ErrorAction SilentlyContinue
-            Remove-VDPortgroup -VDPortgroup $old -Confirm:$false -ErrorAction SilentlyContinue
-        }}
-        # Also remove any stale vmk with same IP
-        Get-VMHostNetworkAdapter -VMHost $vmhost -ErrorAction SilentlyContinue |
-            Where-Object {{ $_.IP -eq '{ip}' }} |
-            Remove-VMHostNetworkAdapter -Confirm:$false -ErrorAction SilentlyContinue
-
-        $pg = New-VDPortgroup -VDSwitch $vds -Name '{pg_name}' -VLanId {vlan_id} -ErrorAction SilentlyContinue
-        if (-not $pg) {{ Write-Host 'ERROR:PG_CREATE_FAILED'; exit }}
-
-        # Create vmk via New-VMHostNetworkAdapter (same approach as VLAN check — proven working)
-        $vmk = New-VMHostNetworkAdapter -VMHost $vmhost `
-            -PortGroup $pg -VirtualSwitch $vds `
-            -IP '{ip}' -SubnetMask '{mask}' `
-            -ErrorAction SilentlyContinue
-        if (-not $vmk) {{ Write-Host 'ERROR:VMK_CREATE_FAILED'; exit }}
-        Write-Host "VMK_NAME:$($vmk.Name)"
-        Disconnect-VIServer -Confirm:$false | Out-Null
-    """)
-    with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w") as f:
-        f.write(script); fname = f.name
-    try:
-        r = subprocess.run(["pwsh", "-NonInteractive", "-NoProfile", "-File", fname],
-                           capture_output=True, text=True, timeout=90)
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("ERROR:"):
-                return None, line[6:]
-            if line.startswith("VMK_NAME:"):
-                val = line[9:].strip()
-                return (val, None) if val else (None, "Empty vmk name")
-        return None, f"No VMK_NAME in output. stdout={r.stdout[:400]} stderr={r.stderr[:200]}"
-    except Exception as e:
-        return None, str(e)
-    finally:
-        try: os.unlink(fname)
-        except: pass
-
-
 def _pcli_get_pg_vlan(vc_url, vc_user, vc_pass, pg_name, pg_moref=None):
     """Return the integer VLAN ID of a DVPortGroup.
     NOTE: $pg.VLanId is unreliable (often empty).
@@ -5236,28 +5695,42 @@ def dns_check_hosts():
         # Priority: (1) use zone_id → fetch live zone-associations
         #           (2) fall back to cluster_morefs list from frontend
         #           (3) fall back to single cluster_moref
+        # Multi-zone deployments select SEVERAL zones (zone_ids): every cluster of
+        # every selected zone must be offered, not just the first zone's.
+        zone_ids = [z for z in (body.get("zone_ids") or []) if z]
+        if zone_id and zone_id not in zone_ids:
+            zone_ids.insert(0, zone_id)
         cluster_ids = []
-        if zone_id:
+        if zone_ids:
             try:
                 _ar = vc_get(vc_url, token,
                              "/api/vcenter/consumption-domains/zone-associations/cluster")
                 _assocs = (_ar.get("associations", [])
                            if isinstance(_ar, dict) else _ar or [])
-                for _a in _assocs:
-                    if (_a.get("zone") == zone_id and
-                            _a.get("state", "ASSOCIATED") == "ASSOCIATED"):
-                        cluster_ids.append(_a.get("cluster", ""))
-                cluster_ids = [c for c in cluster_ids if c]
+                for _zid in zone_ids:
+                    for _a in _assocs:
+                        if (_a.get("zone") == _zid and
+                                _a.get("state", "ASSOCIATED") == "ASSOCIATED"):
+                            cluster_ids.append(_a.get("cluster", ""))
             except Exception:
                 pass
-        if not cluster_ids:
-            cluster_ids = [c for c in (body.get("cluster_morefs") or []) if c]
+        # Also honour the cluster list sent by the frontend (union, de-duplicated)
+        cluster_ids += [c for c in (body.get("cluster_morefs") or []) if c]
         if not cluster_ids:
             single = (body.get("cluster_moref") or "").strip()
             if single:
                 cluster_ids = [single]
+        cluster_ids = list(dict.fromkeys(c for c in cluster_ids if c))
 
-        # Collect hosts from ALL clusters in the zone (dedup by name)
+        # Cluster names, so the host selector can show where each host lives
+        _cl_names = {}
+        try:
+            _cl_names = {c.get("cluster"): c.get("name", "")
+                         for c in (vc_get(vc_url, token, "/api/vcenter/cluster") or [])}
+        except Exception:
+            pass
+
+        # Collect hosts from ALL selected clusters (dedup by name)
         seen_names = set()
         hosts = []
         for cluster_id in cluster_ids:
@@ -5267,7 +5740,9 @@ def dns_check_hosts():
                 hname = h.get("name", "")
                 if hname and hname not in seen_names:
                     seen_names.add(hname)
-                    hosts.append({"name": hname, "short": hname.split(".")[0]})
+                    hosts.append({"name": hname, "short": hname.split(".")[0],
+                                  "cluster": cluster_id,
+                                  "cluster_name": _cl_names.get(cluster_id, "")})
 
         # ── Preview: management portgroup VLAN ──────────────────────────────
         mgt_vlan = None
@@ -5336,20 +5811,21 @@ def check_dns_connectivity():
     pg_name       = body.get("port_group_name") or body.get("port_group_id", "")
     first_ip_raw  = body.get("first_ip", "")
     gateway_cidr  = body.get("gateway_cidr", "")
+    ip_mode       = body.get("ip_mode", "static")
     dns_raw       = body.get("dns_servers", "")
     search_dom    = (body.get("search_domain") or "").strip()
     esx_pass      = body.get("esx_pass", "")
 
     first_ip = re.split(r'[-/\s]', first_ip_raw.strip())[0].strip()
-    if not first_ip:
+    if not first_ip and ip_mode != "dhcp":
         return jsonify({"success": False, "error": "No Control-Plane IP provided"})
     try:    prefix = int(gateway_cidr.split("/")[-1])
     except: prefix = 24
     gw_ip    = gateway_cidr.split("/")[0].strip()
     dns_list = [s.strip() for s in re.split(r'[,\s]+', dns_raw) if s.strip()]
-    if not dns_list:
+    if not dns_list and ip_mode != "dhcp":
         return jsonify({"success": False, "error": "No DNS server specified"})
-    dns_ip = dns_list[0]
+    dns_ip = dns_list[0] if dns_list else ""
 
     ntp_raw  = body.get("ntp_servers", "")
     ntp_list = [s.strip() for s in re.split(r'[,\s]+', ntp_raw) if s.strip()]
@@ -5370,16 +5846,22 @@ def check_dns_connectivity():
         """
         p_out, p_err = run_fn(
             f"vmkping -S {stack_name} -c 3 -W 2 {ntp_server} 2>&1", timeout=12)
-        ping_ok = "0% packet loss" in p_out or "bytes from" in p_out
+        ping_ok = ", 0% packet loss" in p_out or "bytes from" in p_out
         return ("pass" if ping_ok else "fail"), (p_out + p_err).strip()
 
     result = {
         "success": False, "error": "",
         "host": "", "vmk": "", "vlan_id": None, "ip_used": first_ip,
+        "ip_mode": ip_mode,
         "gw_ping": None, "dns_ping": None, "dns_resolve": None,
         "mgt_ntp_check": None, "mgt_ntp_server": ntp_ip, "mgt_ntp_detail": "",
         "gw_ping_output": "", "dns_ping_output": "", "dns_resolve_output": "",
         "dns_domain": "",
+        "ip_free_checks": [],
+        "vc_ping_check": None, "vc_ping_host": "", "vc_ping_output": "",
+        "nsx_ping_check": None, "nsx_ping_host": "", "nsx_ping_output": "",
+        # DHCP mode extra
+        "dhcp_ip_received": None, "dhcp_ip": "",
         # Workload network test results
         "wld_vmk": "", "wld_vlan_id": None, "wld_ip_used": "", "wld_gateway": "",
         "wld_gw_ping": None, "wld_dns_ping": None, "wld_dns_resolve": None,
@@ -5491,119 +5973,168 @@ def check_dns_connectivity():
                 _, so, se = ssh_client.exec_command(cmd, timeout=timeout)
                 return so.read().decode("utf-8","replace"), se.read().decode("utf-8","replace")
 
-            # Configure IP and default route on the custom stack
-            _run(f"esxcli network ip interface ipv4 set"
-                 f" -i {vmk_name} -I {first_ip} -N {mask} -t static 2>/dev/null",
-                 timeout=10)
-            _run(f"esxcli network ip route ipv4 add"
-                 f" --gateway={gw_ip} --network=default -N {mgt_stack} 2>/dev/null",
-                 timeout=10)
-            _time.sleep(1)
+            if ip_mode == "dhcp":
+                # ── DHCP mode: skip management test ────────────────────────
+                # Supervisor IPs come from DHCP; can't pre-test management
+                # connectivity without a known IP.  Skip all management checks
+                # and proceed directly to the workload test.
+                result["gw_ping"]        = "skip"
+                result["dns_ping"]       = "skip"
+                result["dns_resolve"]    = "skip"
+                result["mgt_ntp_check"]  = "skip"
+                result["ip_free_checks"] = []
+                result["vc_ping_check"]  = "skip"
+                result["nsx_ping_check"] = "skip"
+                result["dhcp_skipped"]   = True
+                result["success"]        = True
 
-            # 1. Gateway ping — uses the stack's routing (same subnet → direct)
-            gw_out, gw_err = _run(
-                f"vmkping -S {mgt_stack} -c 3 -W 2 {gw_ip}", timeout=30)
-            gw_pass = "0% packet loss" in gw_out or "bytes from" in gw_out
-            result["gw_ping"]        = "pass" if gw_pass else "fail"
-            result["gw_ping_output"] = (gw_out + gw_err).strip()
-
-            # 1b. NTP check — vmkping via stack + nc UDP/123
-            if ntp_ip:
-                result["mgt_ntp_check"], result["mgt_ntp_detail"] = \
-                    _ntp_check(_run, mgt_stack, ntp_ip)
             else:
-                result["mgt_ntp_check"] = "skip"
-                result["mgt_ntp_detail"] = ""
+                # ── STATIC IP mode ────────────────────────────────────────
+                # Configure IP and default route on the custom stack
+                _run(f"esxcli network ip interface ipv4 set"
+                     f" -i {vmk_name} -I {first_ip} -N {mask} -t static 2>/dev/null",
+                     timeout=10)
+                _run(f"esxcli network ip route ipv4 add"
+                     f" --gateway={gw_ip} --network=default -N {mgt_stack} 2>/dev/null",
+                     timeout=10)
+                _time.sleep(1)
 
-            # 2. DNS server ping — uses the stack's default route, so it reaches
-            #    the DNS server even when it's cross-subnet (no /32 hack needed).
-            dn_out, dn_err = _run(
-                f"vmkping -S {mgt_stack} -c 3 -W 2 {dns_ip}", timeout=30)
-            dn_pass = "0% packet loss" in dn_out or "bytes from" in dn_out
-            result["dns_ping"]        = "pass" if dn_pass else "fail"
-            result["dns_ping_output"] = (dn_out + dn_err).strip()
+                # 1. Gateway ping — uses the stack's routing (same subnet → direct)
+                gw_out, gw_err = _run(
+                    f"vmkping -S {mgt_stack} -c 3 -W 2 {gw_ip}", timeout=30)
+                gw_pass = ", 0% packet loss" in gw_out or "bytes from" in gw_out
+                result["gw_ping"]        = "pass" if gw_pass else "fail"
+                result["gw_ping_output"] = (gw_out + gw_err).strip()
 
-            # 3. DNS resolution — always test the vCenter itself.
-            #   · FQDN input → forward lookup: nslookup vc-mgmt-a.site-a.vcf.lab <dns>
-            #   · IP input   → reverse lookup to get FQDN, then forward lookup to verify
-            # This is the most meaningful test: the Supervisor VMs must be able to
-            # resolve vCenter by FQDN for day-2 operations.
-
-            def _nslookup(query):
-                """Run nslookup, fall back to busybox if no output."""
-                _o, _e = _run(f"nslookup {query} {dns_ip} 2>&1", timeout=15)
-                if not _o.strip():
-                    _o, _e = _run(f"busybox nslookup {query} {dns_ip} 2>&1", timeout=15)
-                return (_o + _e).strip()
-
-            def _parse_ptr(output):
-                """Extract FQDN from a reverse (PTR) nslookup response.
-                Handles both standard 'name = host.' and busybox 'Address: host.' formats."""
-                import re as _r2
-                for _ln in output.splitlines():
-                    # Standard nslookup: "10.x.x.x.in-addr.arpa  name = vc-mgmt-a.site-a.vcf.lab."
-                    _m = _r2.search(r'name\s*=\s*(\S+)', _ln, _r2.IGNORECASE)
-                    if _m:
-                        return _m.group(1).rstrip('.')
-                # Busybox nslookup: "Address 1: vc-mgmt-a.site-a.vcf.lab."
-                for _ln in output.splitlines():
-                    if not _ln.strip().lower().startswith("address"):
-                        continue
-                    _parts = _ln.split(":", 1)
-                    if len(_parts) < 2:
-                        continue
-                    _val = _parts[1].strip().rstrip('.')
-                    if '#' in _val:          # skip "10.1.1.1#53" (server line)
-                        continue
-                    if ('.' in _val and      # contains dots → likely FQDN
-                            not _val.replace('.','').replace('-','').replace('_','').isdigit()):
-                        return _val
-                return ""
-
-            def _fwd_passed(output):
-                """True if a forward nslookup returned a real answer."""
-                return ("Name:" in output and
-                        "can't find"  not in output and
-                        "NXDOMAIN"    not in output and
-                        "REFUSED"     not in output and
-                        "timed out"   not in output.lower())
-
-            _vc_host_raw = (urlparse(vc_url).hostname or "").strip()
-            _vc_is_ip    = bool(_vc_host_raw) and all(
-                p.isdigit() for p in _vc_host_raw.split(".") if p)
-
-            if _vc_is_ip:
-                # Step 1: reverse lookup (IP → FQDN)
-                rev_out = _nslookup(_vc_host_raw)
-                _vc_fqdn = _parse_ptr(rev_out)
-
-                if _vc_fqdn:
-                    # Step 2: forward lookup (FQDN → confirm IP resolves)
-                    fwd_out = _nslookup(_vc_fqdn)
-                    ns_pass = _fwd_passed(fwd_out)
-                    ns_combined = (
-                        f"Reverse lookup ({_vc_host_raw} → PTR):\n{rev_out}"
-                        f"\n\nForward lookup ({_vc_fqdn}):\n{fwd_out}"
-                    )
-                    result["dns_domain"] = _vc_fqdn
+            # 1b → 6: static-mode only tests (DHCP already ran its own branch above)
+            if ip_mode != "dhcp":
+                # 1b. NTP check
+                if ntp_ip:
+                    result["mgt_ntp_check"], result["mgt_ntp_detail"] = \
+                        _ntp_check(_run, mgt_stack, ntp_ip)
                 else:
-                    # No PTR record — fail, show the reverse output
-                    ns_pass     = False
-                    ns_combined = (
-                        f"Reverse lookup ({_vc_host_raw} → PTR):\n{rev_out}"
-                        f"\n\n(No PTR record — cannot perform forward lookup)"
-                    )
-                    result["dns_domain"] = f"{_vc_host_raw} (PTR)"
-            else:
-                # FQDN input: single forward lookup
-                fwd_out = _nslookup(_vc_host_raw)
-                ns_pass = _fwd_passed(fwd_out)
-                ns_combined = fwd_out
-                result["dns_domain"] = _vc_host_raw
+                    result["mgt_ntp_check"] = "skip"
+                    result["mgt_ntp_detail"] = ""
 
-            result["dns_resolve"]        = "pass" if ns_pass else "fail"
-            result["dns_resolve_output"] = ns_combined[:800]
-            result["success"] = True
+                # 2. DNS server ping
+                dn_out, dn_err = _run(
+                    f"vmkping -S {mgt_stack} -c 3 -W 2 {dns_ip}", timeout=30)
+                dn_pass = ", 0% packet loss" in dn_out or "bytes from" in dn_out
+                result["dns_ping"]        = "pass" if dn_pass else "fail"
+                result["dns_ping_output"] = (dn_out + dn_err).strip()
+
+                # 3. DNS resolution — vCenter FQDN
+                def _nslookup(query):
+                    _o, _e = _run(f"nslookup {query} {dns_ip} 2>&1", timeout=15)
+                    if not _o.strip():
+                        _o, _e = _run(f"busybox nslookup {query} {dns_ip} 2>&1", timeout=15)
+                    return (_o + _e).strip()
+
+                def _parse_ptr(output):
+                    import re as _r2
+                    for _ln in output.splitlines():
+                        _m = _r2.search(r'name\s*=\s*(\S+)', _ln, _r2.IGNORECASE)
+                        if _m:
+                            return _m.group(1).rstrip('.')
+                    for _ln in output.splitlines():
+                        if not _ln.strip().lower().startswith("address"):
+                            continue
+                        _parts = _ln.split(":", 1)
+                        if len(_parts) < 2:
+                            continue
+                        _val = _parts[1].strip().rstrip('.')
+                        if '#' in _val:
+                            continue
+                        if ('.' in _val and
+                                not _val.replace('.','').replace('-','').replace('_','').isdigit()):
+                            return _val
+                    return ""
+
+                def _fwd_passed(output):
+                    return ("Name:" in output and
+                            "can't find"  not in output and
+                            "NXDOMAIN"    not in output and
+                            "REFUSED"     not in output and
+                            "timed out"   not in output.lower())
+
+                _vc_host_raw = (urlparse(vc_url).hostname or "").strip()
+                _vc_is_ip    = bool(_vc_host_raw) and all(
+                    p.isdigit() for p in _vc_host_raw.split(".") if p)
+
+                if _vc_is_ip:
+                    rev_out  = _nslookup(_vc_host_raw)
+                    _vc_fqdn = _parse_ptr(rev_out)
+                    if _vc_fqdn:
+                        fwd_out    = _nslookup(_vc_fqdn)
+                        ns_pass    = _fwd_passed(fwd_out)
+                        ns_combined = (
+                            f"Reverse lookup ({_vc_host_raw} → PTR):\n{rev_out}"
+                            f"\n\nForward lookup ({_vc_fqdn}):\n{fwd_out}"
+                        )
+                        result["dns_domain"] = _vc_fqdn
+                    else:
+                        ns_pass     = False
+                        ns_combined = (
+                            f"Reverse lookup ({_vc_host_raw} → PTR):\n{rev_out}"
+                            f"\n\n(No PTR record — cannot perform forward lookup)"
+                        )
+                        result["dns_domain"] = f"{_vc_host_raw} (PTR)"
+                else:
+                    fwd_out    = _nslookup(_vc_host_raw)
+                    ns_pass    = _fwd_passed(fwd_out)
+                    ns_combined = fwd_out
+                    result["dns_domain"] = _vc_host_raw
+
+                result["dns_resolve"]        = "pass" if ns_pass else "fail"
+                result["dns_resolve_output"] = ns_combined[:800]
+
+                # 4. Ping Supervisor IPs+1..+4 via DEFAULT stack
+                import ipaddress as _ipa3
+                _base_int = int(_ipa3.ip_address(first_ip))
+                _ip_free_checks = []
+                for _i in range(1, 5):
+                    try:
+                        _other_ip = str(_ipa3.ip_address(_base_int + _i))
+                        _p_out2, _p_err2 = _run(
+                            f"vmkping -c 2 -W 1 {_other_ip} 2>&1", timeout=8)
+                        _in_use = ", 0% packet loss" in _p_out2 or "bytes from" in _p_out2
+                        _ip_free_checks.append({
+                            "ip": _other_ip, "free": not _in_use,
+                            "output": (_p_out2 + _p_err2).strip()})
+                    except Exception:
+                        pass
+                result["ip_free_checks"] = _ip_free_checks
+
+                # 5. vCenter ping
+                _vc_host_ping = (urlparse(vc_url).hostname or "").strip()
+                if _vc_host_ping:
+                    _vc_p_out, _vc_p_err = _run(
+                        f"vmkping -c 3 -W 2 {_vc_host_ping} 2>&1", timeout=15)
+                    _vc_ping_ok = ", 0% packet loss" in _vc_p_out or "bytes from" in _vc_p_out
+                    result["vc_ping_check"]  = "pass" if _vc_ping_ok else "fail"
+                    result["vc_ping_host"]   = _vc_host_ping
+                    result["vc_ping_output"] = (_vc_p_out + _vc_p_err).strip()
+                else:
+                    result["vc_ping_check"] = "skip"
+                    result["vc_ping_host"]  = ""
+
+                # 6. NSX ping
+                _nsx_raw2  = (body.get("nsx_url") or "").strip()
+                _nsx_url2  = normalize_url(_nsx_raw2) if _nsx_raw2 else guess_nsx_url(vc_url)
+                _nsx_host2 = (urlparse(_nsx_url2).hostname or "").strip()
+                if _nsx_host2:
+                    _nsx_p_out, _nsx_p_err = _run(
+                        f"vmkping -c 3 -W 2 {_nsx_host2} 2>&1", timeout=15)
+                    _nsx_ping_ok = ", 0% packet loss" in _nsx_p_out or "bytes from" in _nsx_p_out
+                    result["nsx_ping_check"]  = "pass" if _nsx_ping_ok else "fail"
+                    result["nsx_ping_host"]   = _nsx_host2
+                    result["nsx_ping_output"] = (_nsx_p_out + _nsx_p_err).strip()
+                else:
+                    result["nsx_ping_check"] = "skip"
+                    result["nsx_ping_host"]  = ""
+
+                result["success"] = True
+                # end of ip_mode != "dhcp" block — DHCP mode sets success within its own branch
 
         finally:
             # Primary cleanup: remove vmk then custom stack via esxcli.
@@ -5666,16 +6197,24 @@ def check_dns_connectivity():
                     _wld_mask    = str(_ip2.IPv4Network(f"0.0.0.0/{_wld_prefix}").netmask)
                     _wld_net     = _ip2.ip_interface(_wld_gw_cidr).network
 
-                    # ── 2. NSX VDS name ──────────────────────────────────────
+                    # ── 2. NSX VDS name for the selected host ────────────────
                     _htns = (nsx_get(_nsx_url, _nsx_user, _nsx_pass,
                         "/policy/api/v1/infra/sites/default/enforcement-points"
                         "/default/host-transport-nodes") or {}).get("results", [])
-                    _nsx_vds = ""
+                    # Build per-host map; use the selected host's own VDS so the
+                    # temp portgroup is created on the correct cluster's VDS.
+                    _host_vds_map_wld: dict = {}
                     for _h in _htns:
+                        _hfqdn = ((_h.get("node_deployment_info") or {}).get("fqdn")
+                                  or _h.get("display_name", ""))
                         for _hs in (_h.get("host_switch_spec") or {}).get("host_switches") or []:
-                            _nsx_vds = _hs.get("host_switch_name", "")
-                            if _nsx_vds: break
-                        if _nsx_vds: break
+                            _vn = _hs.get("host_switch_name", "")
+                            if _vn and _hfqdn:
+                                _host_vds_map_wld[_hfqdn] = _vn
+                                break
+                    # Prefer the selected host's VDS; fall back to any known VDS
+                    _nsx_vds = (_host_vds_map_wld.get(host_name)
+                                or next(iter(_host_vds_map_wld.values()), ""))
                     if not _nsx_vds:
                         result["wld_error"] = "Could not determine NSX VDS name."
                     else:
@@ -5782,7 +6321,7 @@ def check_dns_connectivity():
                                         _wgw_o, _wgw_e = _wrun(
                                             f"vmkping -S {wld_stack} -c 3 -W 2 {_wld_gw_ip}",
                                             timeout=30)
-                                        _wgw_pass = ("0% packet loss" in _wgw_o or
+                                        _wgw_pass = (", 0% packet loss" in _wgw_o or
                                                      "bytes from" in _wgw_o)
                                         result["wld_gw_ping"]        = "pass" if _wgw_pass else "fail"
                                         result["wld_gw_ping_output"] = (_wgw_o + _wgw_e).strip()
@@ -5800,7 +6339,7 @@ def check_dns_connectivity():
                                         _wdn_o, _wdn_e = _wrun(
                                             f"vmkping -S {wld_stack} -c 3 -W 2 {_dns_wld_ip}",
                                             timeout=30)
-                                        _wdn_pass = ("0% packet loss" in _wdn_o or
+                                        _wdn_pass = (", 0% packet loss" in _wdn_o or
                                                      "bytes from" in _wdn_o)
                                         result["wld_dns_ping"]        = "pass" if _wdn_pass else "fail"
                                         result["wld_dns_ping_output"] = (_wdn_o + _wdn_e).strip()
@@ -5885,7 +6424,9 @@ def check_vlan():
     host_passwords = body.get("host_passwords") or {}
 
     result: dict = {"success": False, "tests": [], "summary": "", "error": None}
-    pg_name = None
+    pg_name        = None
+    _extra_pg_names: list = []   # PG names created on non-host-0 VDS (for teardown)
+    host_pg_map:   dict  = {}    # fqdn → pg_name used for that host
     hosts   = []
 
     try:
@@ -5941,14 +6482,18 @@ def check_vlan():
             "/policy/api/v1/infra/sites/default/enforcement-points"
             "/default/host-transport-nodes") or {}).get("results", [])
         nsx_vds_name = ""
+        host_vds_map: dict = {}   # fqdn → NSX VDS name on that host
         for h in htns:
             fqdn = (h.get("node_deployment_info") or {}).get("fqdn") or h.get("display_name", "")
             if not fqdn: continue
             hosts.append(fqdn)
-            if not nsx_vds_name:
-                for hs in (h.get("host_switch_spec") or {}).get("host_switches") or []:
-                    nsx_vds_name = hs.get("host_switch_name", "")
-                    if nsx_vds_name: break
+            for hs in (h.get("host_switch_spec") or {}).get("host_switches") or []:
+                _vn = hs.get("host_switch_name", "")
+                if _vn:
+                    host_vds_map[fqdn] = _vn
+                    if not nsx_vds_name:
+                        nsx_vds_name = _vn   # fallback / error-check below
+                    break
         if not hosts:
             result["error"] = "No prepared ESX hosts found — complete S3 (NSX Host Preparation) first."
             return jsonify(result)
@@ -6007,6 +6552,7 @@ def check_vlan():
         if setup_err:
             result["error"] = f"PowerCLI setup failed: {setup_err}"
             return jsonify(result)
+        host_pg_map[hosts[0]] = pg_name
 
         # ── 5b. Pre-scan from host-0 ───────────────────────────────────────
         # Scan ALL IPs in block (excl. gateway, excl_ranges, host-0's own IP).
@@ -6148,121 +6694,174 @@ def check_vlan():
                 # Keep SSH enabled — the main gateway-ping loop needs it for host-0
 
         # ── 5c. Phase 2: vmknics for hosts 1-N ────────────────────────────
+        # Group remaining hosts by their NSX VDS so each cluster's hosts get
+        # a vmk created on the correct VDS (each cluster has its own VDS).
+        # IMPORTANT: use a unique PG name per VDS group. The cleanup block
+        # inside _pcli_setup_vlan_test (pg_already_exists=False) searches for
+        # the PG by name globally across ALL VDS switches. If two groups shared
+        # the same name, the second group would delete the first group's PG —
+        # stripping vmks from the already-prepared hosts before they get tested.
         if len(hosts) > 1:
-            _ph2_arg = [(hosts[i], temp_ips[i], mask_str) for i in range(1, len(hosts))]
-            _vmk2, _, _err2 = _pcli_setup_vlan_test(
-                vc_url, vc_user, vc_pass, nsx_vds_name, pg_name, vlan_id,
-                _ph2_arg, pg_already_exists=True)
-            if not _err2:
-                vmk_map.update(_vmk2)
+            _vds_groups: dict = {}   # vds_name → [(fqdn, ip, mask), ...]
+            _host0_vds = host_vds_map.get(hosts[0], nsx_vds_name)
+            for _i in range(1, len(hosts)):
+                _vn = host_vds_map.get(hosts[_i], nsx_vds_name)
+                _vds_groups.setdefault(_vn, []).append(
+                    (hosts[_i], temp_ips[_i], mask_str))
 
-        # ── 6. Per-host: SSH → gateway ping ───────────────────────────────
-        for idx, fqdn in enumerate(hosts):
-            temp_ip = temp_ips[idx]
-            vmk_dev = vmk_map.get(fqdn)
-            test: dict = {
-                "host": fqdn, "vlan_id": vlan_id,
-                "temp_ip": temp_ip, "gateway": gateway_ip,
-                "vmk": vmk_dev, "result": "error", "output": "", "error": None,
-                "conflict": _prescan_conflict if idx == 0 else None
+            _vds_idx = 0
+            # Pre-compute per-group params (sequential — order matters for naming)
+            _vds_group_args = []
+            for _vn, _h_list in _vds_groups.items():
+                if _vn == _host0_vds:
+                    _this_pg   = pg_name
+                    _pg_exists = True
+                else:
+                    _vds_idx  += 1
+                    _this_pg   = f"{pg_name}-{_vds_idx}"
+                    _pg_exists = False
+                    _extra_pg_names.append(_this_pg)
+                for _fqdn, _, _ in _h_list:
+                    host_pg_map[_fqdn] = _this_pg
+                _vds_group_args.append((_vn, _this_pg, _pg_exists, _h_list))
+
+            # Run all VDS groups in parallel — each creates vmks on its own VDS
+            import concurrent.futures as _cf2
+            def _setup_group(args):
+                _vn2, _tpg, _pge, _hl = args
+                return _pcli_setup_vlan_test(
+                    vc_url, vc_user, vc_pass, _vn2, _tpg, vlan_id,
+                    _hl, pg_already_exists=_pge)
+
+            with _cf2.ThreadPoolExecutor(max_workers=len(_vds_group_args)) as _p2:
+                for _vmk2, _, _err2 in _p2.map(_setup_group, _vds_group_args):
+                    if not _err2:
+                        vmk_map.update(_vmk2)
+
+        # ── 6. Per-host: SSH → gateway ping (parallel) ────────────────────
+        import concurrent.futures as _cf3
+
+        def _run_host_test(_idx, _fqdn, _tip, _vmk_dev):
+            """SSH + vmkping for one host. Fully self-contained, thread-safe."""
+            _test: dict = {
+                "host": _fqdn, "vlan_id": vlan_id,
+                "temp_ip": _tip, "gateway": gateway_ip,
+                "vmk": _vmk_dev, "result": "error", "output": "", "error": None,
+                "conflict": _prescan_conflict if _idx == 0 else None
             }
-            result["tests"].append(test)
-            steps = (list(_prescan_steps) if idx == 0 else []) + [
-                f"✓ VDS='{nsx_vds_name}', PG='{pg_name}' (VLAN {vlan_id})",
-                f"✓ Temp IP={temp_ip}/{prefix_len}, Gateway={gateway_ip}"
+            _steps = (list(_prescan_steps) if _idx == 0 else []) + [
+                f"✓ VDS='{host_vds_map.get(_fqdn, nsx_vds_name)}'"
+                f", PG='{host_pg_map.get(_fqdn, pg_name)}' (VLAN {vlan_id})",
+                f"✓ Temp IP={_tip}/{prefix_len}, Gateway={gateway_ip}"
             ]
-            ssh_state = None
-            ssh_client = None
+            _ssh_state  = None
+            _ssh_client = None
 
             try:
-                if not vmk_dev:
-                    test["error"] = (f"PowerCLI failed to create vmk on {fqdn}. "
-                                     f"Check PowerCLI setup output for VMK_ERR lines.")
-                    test["output"] = "\n".join(steps); continue
+                if not _vmk_dev:
+                    _test["error"] = (f"PowerCLI failed to create vmk on {_fqdn}. "
+                                      f"Check PowerCLI setup output for VMK_ERR lines.")
+                    _test["output"] = "\n".join(_steps)
+                    return _test
 
-                steps.append(f"✓ vmk created via PowerCLI: {vmk_dev} with IP {temp_ip}/{prefix_len}")
+                _steps.append(
+                    f"✓ vmk created via PowerCLI: {_vmk_dev} with IP {_tip}/{prefix_len}")
 
-                # For host-0 SSH was already enabled during the pre-scan phase.
-                # _prescan_ssh_was_on tells us whether WE enabled it (False) or
-                # it was already on (True / None = pre-scan was skipped).
-                if idx == 0 and _prescan_ssh_was_on is not None:
-                    ssh_state = _prescan_ssh_was_on
-                    steps.append("✓ SSH enabled (from pre-scan phase)")
+                if _idx == 0 and _prescan_ssh_was_on is not None:
+                    _ssh_state = _prescan_ssh_was_on
+                    _steps.append("✓ SSH enabled (from pre-scan phase)")
                 else:
-                    ok_ssh, ssh_state = _vc_manage_ssh(vc_url, vc_user, vc_pass, fqdn, True)
-                    if not ok_ssh:
-                        test["error"] = f"Could not enable SSH on {fqdn} via vCenter"
-                        test["output"] = "\n".join(steps); continue
-                    if not ssh_state:
+                    _ok_ssh, _ssh_state = _vc_manage_ssh(
+                        vc_url, vc_user, vc_pass, _fqdn, True)
+                    if not _ok_ssh:
+                        _test["error"] = f"Could not enable SSH on {_fqdn} via vCenter"
+                        _test["output"] = "\n".join(_steps)
+                        return _test
+                    if not _ssh_state:
                         _time.sleep(5)
-                    steps.append("✓ SSH enabled")
+                    _steps.append("✓ SSH enabled")
 
-                host_pwd = host_passwords.get(fqdn) or esx_pass
-                ssh_client = _para.SSHClient()
-                ssh_client.set_missing_host_key_policy(_para.AutoAddPolicy())
-                for attempt in range(6):
+                _host_pwd  = host_passwords.get(_fqdn) or esx_pass
+                _ssh_client = _para.SSHClient()
+                _ssh_client.set_missing_host_key_policy(_para.AutoAddPolicy())
+                for _att in range(6):
                     try:
-                        ssh_client.connect(fqdn, username="root",
-                                           password=host_pwd, timeout=10)
+                        _ssh_client.connect(
+                            _fqdn, username="root", password=_host_pwd, timeout=10)
                         break
-                    except Exception as e_ssh:
-                        err_str = str(e_ssh).lower()
-                        is_auth = (
-                            "authentication" in err_str or
-                            "bad authentication type" in err_str or
-                            "keyboard-interactive" in err_str or
-                            "publickey" in err_str
-                        )
-                        if is_auth:
+                    except Exception as _es:
+                        _es_str = str(_es).lower()
+                        if any(k in _es_str for k in (
+                                "authentication", "bad authentication",
+                                "keyboard", "publickey")):
                             raise RuntimeError(
-                                f"ESX root password incorrect for {fqdn}.\n"
-                                "Please enter the correct root password and run again.") from e_ssh
-                        if attempt < 5: _time.sleep(2)
+                                f"ESX root password incorrect for {_fqdn}.\n"
+                                "Please enter the correct root password and run again."
+                            ) from _es
+                        if _att < 5: _time.sleep(2)
                         else: raise RuntimeError(
-                            f"Cannot reach {fqdn} via SSH.\n"
-                            "Check that port 22 is reachable from this VM.") from e_ssh
-                steps.append("✓ SSH connected")
+                            f"Cannot reach {_fqdn} via SSH.\n"
+                            "Check that port 22 is reachable from this VM.") from _es
+                _steps.append("✓ SSH connected")
 
-                def _run(cmd, timeout=30):
-                    _, so, se = ssh_client.exec_command(cmd, timeout=timeout)
-                    return so.read().decode("utf-8","replace"), se.read().decode("utf-8","replace")
+                def _hrun(cmd, timeout=30):
+                    _, _so, _se = _ssh_client.exec_command(cmd, timeout=timeout)
+                    return (_so.read().decode("utf-8", "replace"),
+                            _se.read().decode("utf-8", "replace"))
 
-                _time.sleep(2)   # brief pause for vmk IP stack to initialise
+                _time.sleep(2)   # let vmk IP stack initialise
 
-                # ── Gateway ping ──────────────────────────────────────────────
-                ping_out, ping_err = _run(
-                    f"vmkping -I {vmk_dev} -d -s 28 {gateway_ip}", timeout=30)
-                ping_combined = (ping_out + ping_err).strip()
-                steps.append(f"vmkping {gateway_ip} (gateway):\n{ping_combined}"
-                              if ping_combined else "vmkping: no output")
-                gw_passed = "0% packet loss" in ping_out or "bytes from" in ping_out
-                test["result"] = "pass" if gw_passed else "fail"
+                _pout, _perr = _hrun(
+                    f"vmkping -I {_vmk_dev} -d -s 28 {gateway_ip}", timeout=30)
+                _pcomb = (_pout + _perr).strip()
+                _steps.append(f"vmkping {gateway_ip} (gateway):\n{_pcomb}"
+                               if _pcomb else "vmkping: no output")
+                _gw_ok = ", 0% packet loss" in _pout or "bytes from" in _pout
+                _test["result"] = "pass" if _gw_ok else "fail"
+                _test["output"] = "\n".join(_steps)
 
-                test["output"] = "\n".join(steps)
-
-            except Exception as exc:
-                if isinstance(exc, RuntimeError):
-                    test["error"] = str(exc)
-                else:
-                    test["error"] = f"{exc}\n{traceback.format_exc()}"
-                test["output"] = "\n".join(steps)
+            except Exception as _exc:
+                _test["error"] = (str(_exc) if isinstance(_exc, RuntimeError)
+                                  else f"{_exc}\n{traceback.format_exc()}")
+                _test["output"] = "\n".join(_steps)
             finally:
-                if ssh_client:
-                    # Primary vmk cleanup: esxcli while SSH is still open —
-                    # runs whether the test passed, failed, or raised an exception.
-                    if vmk_dev:
+                if _ssh_client:
+                    if _vmk_dev:
                         try:
-                            _, _so, _ = ssh_client.exec_command(
-                                f"esxcli network ip interface remove -i {vmk_dev}",
+                            _, _so2, _ = _ssh_client.exec_command(
+                                f"esxcli network ip interface remove -i {_vmk_dev}",
                                 timeout=15)
-                            _so.read()   # drain channel so it closes cleanly
+                            _so2.read()
                         except Exception:
                             pass
-                    try: ssh_client.close()
+                    try: _ssh_client.close()
                     except Exception: pass
-                if ssh_state is False:
-                    try: _vc_manage_ssh(vc_url, vc_user, vc_pass, fqdn, False)
+                if _ssh_state is False:
+                    try: _vc_manage_ssh(vc_url, vc_user, vc_pass, _fqdn, False)
                     except Exception: pass
+
+            return _test
+
+        _h_results = [None] * len(hosts)
+        with _cf3.ThreadPoolExecutor(max_workers=min(len(hosts), 12)) as _pool3:
+            _futs = {
+                _pool3.submit(_run_host_test, i, hosts[i], temp_ips[i],
+                              vmk_map.get(hosts[i])): i
+                for i in range(len(hosts))
+            }
+            for _fut in _cf3.as_completed(_futs):
+                _i = _futs[_fut]
+                try:
+                    _h_results[_i] = _fut.result()
+                except Exception as _fe:
+                    _h_results[_i] = {
+                        "host": hosts[_i], "vlan_id": vlan_id,
+                        "temp_ip": temp_ips[_i], "gateway": gateway_ip,
+                        "vmk": vmk_map.get(hosts[_i]),
+                        "result": "error", "output": "",
+                        "error": str(_fe), "conflict": None
+                    }
+        result["tests"] = [r for r in _h_results if r is not None]
 
         passed    = sum(1 for t in result["tests"] if t["result"] == "pass")
         total     = len(result["tests"])
@@ -6331,6 +6930,9 @@ def check_vlan():
     finally:
         if pg_name and hosts:
             try: _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, pg_name, hosts)
+            except Exception: pass
+        for _epg in _extra_pg_names:
+            try: _pcli_cleanup_vlan_test(vc_url, vc_user, vc_pass, _epg, hosts)
             except Exception: pass
 
     return jsonify(result)
@@ -7041,6 +7643,121 @@ def build_topology():
         import traceback
         return jsonify({'success': False, 'error': str(e),
                         'tb': traceback.format_exc()})
+
+
+
+
+# ── VPC Public Subnets ─────────────────────────────────────────────────────────
+
+@app.route("/api/nsx-vpc-public-subnets", methods=["POST"])
+def nsx_vpc_public_subnets():
+    body     = request.get_json(force=True)
+    nsx_url  = normalize_url(body.get("nsx_url", ""))
+    nsx_user = body.get("nsx_user", "admin")
+    nsx_pass = body.get("nsx_pass", "")
+    subnets  = []
+    try:
+        # Use search/aggregate with context:"projects:ALL" — finds subnets across every project
+        # in one call (same API the NSX UI uses).
+        search_body = {
+            "primary": {"resource_type": "VpcSubnet", "filters": []},
+            "related": [
+                {
+                    "resource_type": "Vpc",
+                    "join_condition": "path:parent_path",
+                    "alias": "Vpc",
+                    "included_fields": "id,path,display_name",
+                }
+            ],
+            "context": "projects:ALL",
+        }
+        cursor = 0
+        page_size = 200
+        while True:
+            resp = SESS.post(
+                f"{nsx_url}/policy/api/v1/search/aggregate?page_size={page_size}&cursor={cursor}",
+                json=search_body,
+                auth=(nsx_user, nsx_pass),
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                timeout=20,
+                verify=False,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            for result in results:
+                primary = result.get("primary", {})
+                if (primary.get("access_mode") or "").lower() != "public":
+                    continue
+                path = primary.get("path", "")
+                # path: /orgs/default/projects/{proj}/vpcs/{vpc}/subnets/{sub}
+                parts = path.split("/")
+                proj_id  = parts[4] if len(parts) > 4 else "default"
+                vpc_alias = next(
+                    (r for r in result.get("related", []) if r.get("alias") == "Vpc"), {}
+                )
+                vpc_results = vpc_alias.get("results") or [{}]
+                vpc_name = vpc_results[0].get("display_name", "") if vpc_results else ""
+                subnets.append({
+                    "path":         path,
+                    "id":           primary.get("id", ""),
+                    "display_name": primary.get("display_name", primary.get("id", "")),
+                    "project":      proj_id,
+                    "vpc":          vpc_name,
+                    "ip_addresses": primary.get("ip_addresses", []),
+                })
+            # Paginate if needed
+            total = data.get("result_count", 0)
+            cursor += len(results)
+            if cursor >= total or not results:
+                break
+
+        return jsonify({"success": True, "subnets": subnets})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "subnets": []})
+
+
+@app.route("/api/check-vpc-subnet-dhcp", methods=["POST"])
+def check_vpc_subnet_dhcp():
+    """Check whether a VPC Public subnet has DHCP Server or Relay enabled.
+    Accepts subnet_path (NSX Policy path like /orgs/default/projects/P/vpcs/V/subnets/S).
+    """
+    body        = request.get_json(force=True)
+    nsx_url     = normalize_url(body.get("nsx_url", ""))
+    nsx_user    = body.get("nsx_user", "admin")
+    nsx_pass    = body.get("nsx_pass", "")
+    subnet_path = (body.get("subnet_path") or "").strip()
+    if not subnet_path:
+        return jsonify({"dhcp_enabled": False, "error": "No subnet path provided"})
+    try:
+        # The NSX Policy path is like /orgs/default/projects/P/vpcs/V/subnets/S
+        # Build the full REST URL: /policy/api/v1<path>
+        api_path = f"/policy/api/v1{subnet_path}"
+        resp = SESS.get(
+            f"{nsx_url}{api_path}",
+            auth=(nsx_user, nsx_pass),
+            headers={"Accept": "application/json"},
+            timeout=15,
+            verify=False,
+        )
+        if resp.status_code == 404:
+            return jsonify({"dhcp_enabled": False, "error": "Subnet not found"})
+        resp.raise_for_status()
+        data = resp.json()
+        # Check dhcp_config - mode can be "SERVER", "RELAY", or "NONE"/absent
+        dhcp_cfg  = data.get("dhcp_config") or {}
+        dhcp_mode = (dhcp_cfg.get("mode") or dhcp_cfg.get("resource_type") or "").upper()
+        # Also check subnet_dhcp_config (alternate field name in some NSX versions)
+        if not dhcp_mode:
+            sub_dhcp = data.get("subnet_dhcp_config") or {}
+            dhcp_mode = (sub_dhcp.get("mode") or "").upper()
+        # Also check top-level dhcp_server_config
+        if not dhcp_mode and data.get("dhcp_server_config"):
+            dhcp_mode = "SERVER"
+        enabled = dhcp_mode in ("SERVER", "RELAY", "DHCP_SERVER", "DHCP_RELAY")
+        return jsonify({"dhcp_enabled": enabled, "dhcp_mode": dhcp_mode or "NONE", "error": None})
+    except Exception as e:
+        return jsonify({"dhcp_enabled": None, "error": str(e)})
 
 
 if __name__ == "__main__":

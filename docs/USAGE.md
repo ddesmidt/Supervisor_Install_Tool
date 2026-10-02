@@ -210,13 +210,30 @@ Once all steps in a column are green, click **"Deploy Supervisor"** in that colu
 
 A 5-step wizard opens:
 
-### Wizard Step 1 — Cluster
+### Wizard Step 1 — Cluster & HA Mode
 
-Select the vSphere Zone (or compute cluster) to enable Supervisor on.
+**HA Mode checkbox** at the top of the step controls the number of Supervisor control-plane VMs:
 
-- **Zone(s) configured**: a **Zone-based selector** is shown — choose the vSphere Zone that contains your target cluster. If a **Cluster Scope Filter** is active (Step 3), zones whose clusters are all outside the filter are shown as greyed-out and cannot be selected. Zones with at least one cluster in the filter remain selectable.
-- **Clusters not in any zone**: if the vCenter has clusters that have not been assigned to a vSphere Zone, they appear in a separate **"Clusters not in a zone"** section below the zone list and can be selected directly.
-- **No Zone configured**: a **cluster selector** is shown — choose the cluster directly. If only one cluster exists it is pre-selected.
+| HA Mode | Control-plane VMs | Zone requirement |
+|---|---|---|
+| ✅ Enabled (default) | **3** — spread across zones | 1, 2, or 3 zones |
+| ☐ Disabled | **1** — single VM | 1 zone or cluster |
+
+Below the HA mode checkbox, choose a **placement strategy**:
+
+| Mode | Description | Requires |
+|---|---|---|
+| **Specific Cluster / Zone** | You pick which zone or cluster to deploy to | Any |
+| **Least Loaded Cluster / Zone** | Tool auto-selects the zone or cluster with the fewest existing VMs | ≥ 2 clusters (for auto) |
+| **Multiple Zones (HA across Zones)** | Spreads control-plane VMs across 2–3 zones | HA Mode + ≥ 2 clusters |
+
+**Zone selector** — Once a placement mode is chosen, the available zones/clusters appear:
+
+- **Zone(s) configured**: a **Zone-based selector** is shown. If a **Cluster Scope Filter** is active (Step 3), zones whose clusters are all outside the filter are greyed-out and cannot be selected.
+- **Clusters not in any zone**: clusters that have not yet been assigned to a vSphere Zone appear in a separate section and can be selected directly. The tool will **automatically create a vSphere Zone and assign the cluster** to it before deploying.
+- When **Multiple Zones** mode is selected, tick 2–3 zones (or clusters); the tool creates one zone per cluster if needed.
+
+**Zone name prefix** (shown when auto-creating zones): defaults to `tool-zone`; zones are created as `tool-zone1`, `tool-zone2`, etc.
 
 ### Wizard Step 2 — Network
 
@@ -231,15 +248,31 @@ Two sections:
 
 **Supervisor Management Network**
 
+The management vNIC can be backed by a **VLAN port group** (traditional) or a **VPC Public subnet** (new). Select the mode with the radio button:
+
+#### VLAN mode (default)
+
 | Field | Description |
 |---|---|
-| Port Group (management VLAN) | Auto-discovered from the VNA node (Distributed) or Edge node (Centralized) — shown with a green ✓ note; falls back to vCenter VM's port group |
-| Supervisor Control-Plane Mgt IPs | Enter the first of 5 consecutive IPs (e.g. `10.1.1.85-10.1.1.89`) |
-| Gateway (IP/prefix) | Auto-populated from VNA/Edge node management interface |
-| DNS Servers — Management | DNS servers for Supervisor VMs to resolve internal FQDNs (vCenter, NSX, ESX hosts) — auto-populated |
-| DNS Servers — Workload | DNS servers for Supervisor Pods and VKS clusters to resolve external FQDNs (e.g. `github.com`) — auto-populated |
-| Search Domain(s) | Auto-populated from VNA/Edge node |
-| NTP Servers | Auto-populated from VNA/Edge node |
+| Port Group | Auto-discovered from the VNA node (Distributed) or Edge node (Centralized) — shown with a green ✓ note; falls back to vCenter VM's port group. In multi-cluster deployments a per-cluster port group map is built automatically. |
+| IP assignment | **Static** (default): enter the first of 5 consecutive control-plane IPs. **DHCP**: IPs are assigned automatically — only a floating IP is needed. |
+| Gateway (IP/prefix) | Auto-populated from VNA/Edge node; editable |
+| DNS — Management | DNS for Supervisor VMs to resolve internal FQDNs — auto-populated |
+| DNS — Workload | DNS for Supervisor Pods / VKS clusters to resolve external FQDNs — auto-populated |
+| Search Domain(s) | Auto-populated |
+| NTP Servers | Auto-populated |
+
+#### VPC Public mode
+
+When the Supervisor management vNIC should be placed on a VPC Public subnet instead of a VLAN port group:
+
+1. Select **VPC Public** — the tool queries NSX for all VPC Public subnets across every project and shows them in a dropdown.
+2. In multi-cluster deployments, a **per-cluster subnet selector** appears — choose one VPC Public subnet for each cluster (they can share the same subnet if it spans both clusters).
+3. Choose **IP assignment**:
+   - **Static** — enter the first control-plane IP manually.
+   - **DHCP** — IPs are assigned by DHCP. The tool calls `/api/check-vpc-subnet-dhcp` to verify that DHCP is enabled on the selected subnet; an error is shown if DHCP is not configured.
+
+> **Note:** "Check Network Connectivity" is not available in VPC Public mode — the button is shown as greyed-out.
 
 ### Optional: Check Network Connectivity
 
@@ -263,7 +296,15 @@ The button turns **green** when all tests pass (gateway + NTP + DNS for each set
 
 ### Wizard Step 3 — Storage
 
-Select the storage policy for Supervisor control plane VMs. The list is filtered to policies compatible with the selected cluster — an info banner shows which cluster the policies are filtered for. An incompatible policy causes a silent EAM placement failure during deployment.
+Select storage policies for three independent Supervisor storage tiers. Each tier shows only policies that are **compatible with the selected cluster's datastores** (checked via the PBM API — the same source vCenter uses):
+
+| Tier | Purpose |
+|---|---|
+| **Control Plane VMs** | Storage policy for the 1 or 3 Supervisor control-plane virtual machines |
+| **Ephemeral Disks** | Storage policy for ephemeral container disk volumes |
+| **Image Cache** | Storage policy for the container image cache layer |
+
+All three default to the same policy; change individual tiers when your environment has dedicated policies per workload type.
 
 ### Wizard Step 4 — Config
 
@@ -276,7 +317,7 @@ An info banner also displays the detected workload network mode and its Service 
 
 ### Wizard Step 5 — Review
 
-A summary table of all settings before deploying: Name, Cluster, Size, NSX Project, VPC Profile, Port Group, Control-Plane IPs, Gateway, DNS (Management), DNS (Workload), Search Domain, NTP, Storage Policy.
+A summary table of all settings before deploying: Name, HA Mode, Cluster/Zone(s), vSphere Cluster, Size, NSX Project, VPC Profile, Management vNIC (Port Group or VPC Public Subnet), IP Assignment, Control-Plane IPs, Gateway, DNS (Management), DNS (Workload), Search Domain, NTP, Control Plane Storage Policy, Ephemeral Disks Storage Policy, Image Cache Storage Policy.
 
 Click **"Deploy"** to start the deployment.
 
