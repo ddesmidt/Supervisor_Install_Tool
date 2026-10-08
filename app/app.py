@@ -2321,6 +2321,62 @@ def wcp_datacenter():
         return jsonify({"datacenter": "", "error": str(e)})
 
 
+def _nsx_vpc_subnet_dvpgs(vc_url, token, nsx_url, nsx_user, nsx_pass, subnet_path):
+    """vCenter port group moref(s) that back an NSX VPC subnet.
+
+    A realized VPC subnet appears in vCenter as a distributed port group; NSX records
+    its moref in the subnet's realized state (RealizedLogicalSwitchDvpg →
+    DvpgRealizationState.portgroup_id).  Falls back to a unique name match among the
+    vCenter distributed port groups.  Raises ValueError if nothing can be resolved.
+    """
+    import json as _json
+    found: list = []
+    err = ""
+    try:
+        r = SESS.get(
+            f"{nsx_url}/policy/api/v1/infra/realized-state/realized-entities",
+            params={"intent_path": subnet_path},
+            auth=(nsx_user, nsx_pass), headers={"Accept": "application/json"},
+            timeout=20, verify=False,
+        )
+        r.raise_for_status()
+        for ent in r.json().get("results", []):
+            if ent.get("entity_type") != "RealizedLogicalSwitchDvpg":
+                continue
+            for attr in ent.get("extended_attributes") or []:
+                if attr.get("key") != "DvpgRealizationState":
+                    continue
+                for v in attr.get("values") or []:
+                    try:
+                        st = _json.loads(v)
+                    except Exception:
+                        continue
+                    pg = st.get("portgroup_id")
+                    if pg and pg not in found and str(st.get("state", "Success")).lower() == "success":
+                        found.append(pg)
+    except Exception as e:
+        err = str(e)
+
+    if not found:
+        # Fallback: vCenter port group named like the subnet (only if unambiguous)
+        sub_id = subnet_path.rstrip("/").split("/")[-1]
+        try:
+            nets = vc_get(vc_url, token, "/api/vcenter/network",
+                          params={"types": "DISTRIBUTED_PORTGROUP"}) or []
+            m = [n["network"] for n in nets if n.get("name") == sub_id and n.get("network")]
+            if len(m) == 1:
+                found = m
+        except Exception:
+            pass
+    if not found:
+        raise ValueError(
+            f"Could not find the vCenter port group backing the VPC subnet '{subnet_path}'"
+            + (f" ({err})" if err else "")
+            + ". Check that the subnet is realized in vCenter."
+        )
+    return found
+
+
 @app.route("/api/install-supervisor", methods=["POST"])
 def install_supervisor():
     """Enable Supervisor using the NSX VPC (enable_on_zones) API."""
@@ -2428,22 +2484,62 @@ def install_supervisor():
         if cfg.get("cluster_moref"):
             _sel_c.add(cfg["cluster_moref"])
         _pg_list: list = []
-        for _pg in [cfg.get("port_group_id")] + [
-                _v for _k, _v in _cpg_map.items() if not _sel_c or _k in _sel_c]:
-            if _pg and _pg not in _pg_list:
-                _pg_list.append(_pg)
+        if cfg.get("management_vnic_mode") == "vpc_public":
+            # VPC Public: the management network is an NSX VPC (public) subnet.  vCenter
+            # sees a realized VPC subnet as a distributed port group, so resolve each
+            # selected subnet to its port group(s) via NSX realized state and use those as
+            # the management backing.  Never fall back to the management port group.
+            _nsx_raw  = (body.get("nsx_url") or "").strip()
+            _nsx_url  = normalize_url(_nsx_raw) if _nsx_raw else guess_nsx_url(vc_url)
+            _nsx_user = body.get("nsx_user") or "admin"
+            _nsx_pass = body.get("nsx_pass") or password
+            _sn_map   = cfg.get("cluster_vpc_subnets") or {}
+            _paths: list = []
+            for _p in [_v for _k, _v in _sn_map.items() if not _sel_c or _k in _sel_c] \
+                      + [cfg.get("vpc_public_subnet_path")]:
+                if _p and _p not in _paths:
+                    _paths.append(_p)
+            if not _paths:
+                raise ValueError("VPC Public management network selected but no VPC subnet was provided.")
+            for _p in _paths:
+                for _pg in _nsx_vpc_subnet_dvpgs(vc_url, token, _nsx_url, _nsx_user, _nsx_pass, _p):
+                    if _pg not in _pg_list:
+                        _pg_list.append(_pg)
+        else:
+            for _pg in [cfg.get("port_group_id")] + [
+                    _v for _k, _v in _cpg_map.items() if not _sel_c or _k in _sel_c]:
+                if _pg and _pg not in _pg_list:
+                    _pg_list.append(_pg)
         if len(_pg_list) > 1:
             _mgmt_backing = {"backing": "NETWORK_SEGMENT",
                              "network_segment": {"networks": _pg_list}}
         else:
-            _mgmt_backing = {"backing": "NETWORK", "network": cfg["port_group_id"]}
+            _mgmt_backing = {"backing": "NETWORK", "network": _pg_list[0] if _pg_list else cfg["port_group_id"]}
+
+        # DHCP management network (e.g. VPC Public subnet with DHCP): no static addressing
+        _mgmt_dhcp = (cfg.get("ip_mode") == "dhcp" and not cfg.get("first_ip"))
+        if _mgmt_dhcp:
+            _ip_mgmt = {"dhcp_enabled": True}
+        else:
+            _ip_mgmt = {
+                "dhcp_enabled": False,
+                "gateway_address": cfg["gateway_cidr"],
+                "ip_assignments": [
+                    {
+                        "assignee": "NODE",
+                        "ranges": [{"address": cfg["first_ip"], "count": 5}],
+                    }
+                ],
+            }
 
         spec = {
             "name": cfg["name"],
             "zones": _zones,
             "control_plane": {
                 "size": cfg.get("size", "SMALL"),
-                "cpvmCount": 3 if cfg.get("ha_mode", True) else 1,
+                # vSphere API 9.0: number of control plane VMs (1 or 3, defaults to 3 if unset).
+                # NB: "cpvmCount" is only the name used in the vCenter UI config file, not in the REST API.
+                "count": 3 if cfg.get("ha_mode", True) else 1,
                 "storage_policy": cfg.get("ctrl_plane_policy_uuid") or cfg["storage_policy_uuid"],
                 "network": {
                     "backing": _mgmt_backing,
@@ -2451,16 +2547,7 @@ def install_supervisor():
                         "dns": {"servers": dns_mgmt, "search_domains": domains},
                         "ntp": {"servers": ntp},
                     },
-                    "ip_management": {
-                        "dhcp_enabled": False,
-                        "gateway_address": cfg["gateway_cidr"],
-                        "ip_assignments": [
-                            {
-                                "assignee": "NODE",
-                                "ranges": [{"address": cfg["first_ip"], "count": 5}],
-                            }
-                        ],
-                    },
+                    "ip_management": _ip_mgmt,
                 },
             },
             "workloads": {
@@ -3516,22 +3603,28 @@ def fix_vna_options():
         # 1. pg_clusters_map: portgroup moref → [cluster morefs] via SOAP
         result["pg_clusters_map"] = _vc_soap_get_pg_cluster_map(vc_url, username, password)
 
-        # 2. cluster_ds_map still uses REST (datastore filter is reliable enough)
-        # 3. cluster_ds_map: cluster moref → [datastore morefs] (use per-cluster hosts)
+        # 2. cluster_ds_map: cluster moref → [datastore morefs] visible to the cluster.
+        # REST datastore filters (filter.hosts / filter.clusters) are ignored or rejected
+        # on some vCenter versions (returning ALL datastores), so use SOAP
+        # PropertyCollector (HostSystem.datastore) — exact.  A datastore is listed for a
+        # cluster only if EVERY host of that cluster (that reported data) can see it.
         try:
-            _cdm: dict = {}
+            _cl_hosts: dict = {}
             for _c in result["clusters"]:
                 _cm = _c.get("cluster", "")
                 if not _cm:
                     continue
-                _hs = vc_get(vc_url, token, "/api/vcenter/host",
-                             params={"clusters": _cm}) or []
-                if _hs:
-                    _hid = _hs[0].get("host", "")
-                    _dsl = vc_get(vc_url, token, "/api/vcenter/datastore",
-                                  params={"hosts": _hid}) or []
-                    _cdm[_cm] = [_d.get("datastore", "") for _d in _dsl
-                                 if _d.get("datastore")]
+                _cl_hosts[_cm] = [_h.get("host", "") for _h in
+                                  (vc_get(vc_url, token, "/api/vcenter/host",
+                                          params={"clusters": _cm}) or [])
+                                  if _h.get("host")]
+            _all_h = sorted({h for hs in _cl_hosts.values() for h in hs})
+            _hds = _soap_get_host_datastores(vc_url, username, password, _all_h)
+            _cdm: dict = {}
+            for _cm, _hs in _cl_hosts.items():
+                _sets = [_hds[h] for h in _hs if h in _hds]
+                if _sets:
+                    _cdm[_cm] = sorted(set.intersection(*[set(s) for s in _sets]))
             result["cluster_ds_map"] = _cdm
         except Exception:
             pass

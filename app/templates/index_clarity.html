@@ -848,16 +848,17 @@
 
                       <!-- Distributed -->
                       <div x-show="col.key === 'distributed'">
-                        <img src="/static/nsx-vpc-distributed.jpg?v=5"
+                        <img src="/static/nsx-vpc-distributed.jpg?v=6"
                              alt="NSX-VPC Distributed Architecture"
                              title="Click to enlarge"
-                             @click="diagImg='/static/nsx-vpc-distributed.jpg?v=4'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
+                             @click="diagImg='/static/nsx-vpc-distributed.jpg?v=6'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
                              style="width:100%; max-height:80px; object-fit:cover; object-position:top; border-radius:4px; border:1px solid #dfe3e6; cursor:zoom-in; margin-bottom:0.45rem; display:block;">
                         <div class="pc-label">Pros</div>
                         <div class="pc-item">· Simple design - No Edge Node / Tier-0 / BGP</div>
                         <div class="pc-item">· Full VCF-Automation support</div>
-                        <div class="pc-item">· Fewer physical fabric IP consumption - K8s nodes use logical private IPs</div>
+                        <div class="pc-item">· More scale - Fewer physical fabric IPs consumed (K8s nodes use logical private IPs)</div>
                         <div class="pc-item">· More secure - No direct access to K8s nodes</div>
+                        <div class="pc-item">· Best high-availability - Simple distribution of Supervisor VMs across vSphere Clusters</div>
                         <div class="pc-label pc-label-gap">Requirements</div>
                         <div class="pc-item">· All ESXi hosts need L2 (VLAN) connectivity to the fabric</div>
                         <div class="pc-item">· Physical fabric MTU &ge; 1700</div>
@@ -865,32 +866,35 @@
 
                       <!-- Centralized -->
                       <div x-show="col.key === 'centralized'">
-                        <img src="/static/nsx-vpc-centralized.jpg?v=2"
+                        <img src="/static/nsx-vpc-centralized.jpg?v=6"
                              alt="NSX-VPC Centralized Architecture"
                              title="Click to enlarge"
-                             @click="diagImg='/static/nsx-vpc-centralized.jpg?v=1'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
+                             @click="diagImg='/static/nsx-vpc-centralized.jpg?v=6'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
                              style="width:100%; max-height:80px; object-fit:cover; object-position:top; border-radius:4px; border:1px solid #dfe3e6; cursor:zoom-in; margin-bottom:0.45rem; display:block;">
                         <div class="pc-label">Pros</div>
                         <div class="pc-item">· Full VCF-Automation support</div>
-                        <div class="pc-item">· Fewer physical fabric IP consumption - K8s nodes use logical private IPs</div>
+                        <div class="pc-item">· More scale - Fewer physical fabric IPs consumed (K8s nodes use logical private IPs)</div>
                         <div class="pc-item">· More secure - No direct access to K8s nodes</div>
+                        <div class="pc-item">· Best high-availability - Simple distribution of Supervisor VMs across vSphere Clusters</div>
                         <div class="pc-label pc-label-gap">Requirements</div>
                         <div class="pc-item">· Physical fabric MTU &ge; 1700</div>
                       </div>
 
                       <!-- VDS / FLB -->
                       <div x-show="col.key === 'vds_flb'">
-                        <img src="/static/vds.jpg?v=3"
+                        <img src="/static/vds.jpg?v=4"
                              alt="VDS Architecture"
                              title="Click to enlarge"
-                             @click="diagImg='/static/vds.jpg?v=1'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
+                             @click="diagImg='/static/vds.jpg?v=4'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
                              style="width:100%; max-height:80px; object-fit:cover; object-position:top; border-radius:4px; border:1px solid #dfe3e6; cursor:zoom-in; margin-bottom:0.45rem; display:block;">
                         <div class="pc-label">Pros</div>
                         <div class="pc-item">· Simple design — no NSX required</div>
                         <div class="pc-label pc-label-gap pc-label-cons">Cons</div>
-                        <div class="pc-item">· Very limited VCF-Automation support</div>
+                        <div class="pc-item">· No VCF-Automation support</div>
                         <div class="pc-item">· Limited network services (No Subnets, Static Routes, NAT)</div>
+                        <div class="pc-item">· Less scale - All VMs and VKS nodes consume public IPs</div>
                         <div class="pc-item">· Less secure - Direct access to K8s nodes</div>
+                        <div class="pc-item">· Less high-availability - Distributing Supervisor VMs across vSphere Clusters is challenging</div>
                         <div class="pc-label pc-label-gap">Requirements</div>
                         <div class="pc-item">· All ESXi hosts need L2 (VLAN) connectivity to the fabric</div>
                       </div>
@@ -1001,47 +1005,51 @@
                   <div class="pros-cons-section">
                     <!-- Distributed -->
                     <div x-show="col.key === 'distributed'">
-                      <img src="/static/nsx-vpc-distributed.jpg?v=5"
+                      <img src="/static/nsx-vpc-distributed.jpg?v=6"
                            alt="NSX-VPC Distributed Architecture"
                            title="Click to enlarge"
-                           @click="diagImg='/static/nsx-vpc-distributed.jpg?v=4'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
+                           @click="diagImg='/static/nsx-vpc-distributed.jpg?v=6'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
                            style="width:100%; max-height:80px; object-fit:cover; object-position:top; border-radius:4px; border:1px solid #dfe3e6; cursor:zoom-in; margin-bottom:0.45rem; display:block;">
                       <div class="pc-label">Pros</div>
                       <div class="pc-item">· Simple design - No Edge Node / Tier-0 / BGP</div>
                       <div class="pc-item">· Full VCF-Automation support</div>
-                      <div class="pc-item">· Fewer physical fabric IP consumption - K8s nodes use logical private IPs</div>
+                      <div class="pc-item">· More scale - Fewer physical fabric IPs consumed (K8s nodes use logical private IPs)</div>
                       <div class="pc-item">· More secure - No direct access to K8s nodes</div>
+                      <div class="pc-item">· Best high-availability - Simple distribution of Supervisor VMs across vSphere Clusters</div>
                       <div class="pc-label pc-label-gap">Requirements</div>
                       <div class="pc-item">· All ESXi hosts need L2 (VLAN) connectivity to the fabric</div>
                       <div class="pc-item">· Physical fabric MTU &ge; 1700</div>
                     </div>
                     <!-- Centralized -->
                     <div x-show="col.key === 'centralized'">
-                      <img src="/static/nsx-vpc-centralized.jpg?v=2"
+                      <img src="/static/nsx-vpc-centralized.jpg?v=6"
                            alt="NSX-VPC Centralized Architecture"
                            title="Click to enlarge"
-                           @click="diagImg='/static/nsx-vpc-centralized.jpg?v=1'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
+                           @click="diagImg='/static/nsx-vpc-centralized.jpg?v=6'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
                            style="width:100%; max-height:80px; object-fit:cover; object-position:top; border-radius:4px; border:1px solid #dfe3e6; cursor:zoom-in; margin-bottom:0.45rem; display:block;">
                       <div class="pc-label">Pros</div>
                       <div class="pc-item">· Full VCF-Automation support</div>
-                      <div class="pc-item">· Fewer physical fabric IP consumption - K8s nodes use logical private IPs</div>
+                      <div class="pc-item">· More scale - Fewer physical fabric IPs consumed (K8s nodes use logical private IPs)</div>
                       <div class="pc-item">· More secure - No direct access to K8s nodes</div>
+                      <div class="pc-item">· Best high-availability - Simple distribution of Supervisor VMs across vSphere Clusters</div>
                       <div class="pc-label pc-label-gap">Requirements</div>
                       <div class="pc-item">· Physical fabric MTU &ge; 1700</div>
                     </div>
                     <!-- VDS / FLB -->
                     <div x-show="col.key === 'vds_flb'">
-                      <img src="/static/vds.jpg?v=3"
+                      <img src="/static/vds.jpg?v=4"
                            alt="VDS Architecture"
                            title="Click to enlarge"
-                           @click="diagImg='/static/vds.jpg?v=1'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
+                           @click="diagImg='/static/vds.jpg?v=4'; showDiagram = true; diagDrag.x = null; diagDrag.y = null;"
                            style="width:100%; max-height:80px; object-fit:cover; object-position:top; border-radius:4px; border:1px solid #dfe3e6; cursor:zoom-in; margin-bottom:0.45rem; display:block;">
                       <div class="pc-label">Pros</div>
                       <div class="pc-item">· Simple design — no NSX required</div>
                       <div class="pc-label pc-label-gap pc-label-cons">Cons</div>
-                      <div class="pc-item">· Very limited VCF-Automation support</div>
+                      <div class="pc-item">· No VCF-Automation support</div>
                       <div class="pc-item">· Limited network services (No Subnets, Static Routes, NAT)</div>
+                      <div class="pc-item">· Less scale - All VMs and VKS nodes consume public IPs</div>
                       <div class="pc-item">· Less secure - Direct access to K8s nodes</div>
+                      <div class="pc-item">· Less high-availability - Distributing Supervisor VMs across vSphere Clusters is challenging</div>
                       <div class="pc-label pc-label-gap">Requirements</div>
                       <div class="pc-item">· All ESXi hosts need L2 (VLAN) connectivity to the fabric</div>
                     </div>
@@ -2166,9 +2174,9 @@
                       const spans = this.dZoneSpans;
                       const nZones = spans.length;
                       if (nZones === 0) return [];
-                      const vmCounts = new Array(nZones).fill(0);
-                      for (let i = 0; i < 3; i++) { vmCounts[i % nZones]++; }
-                      return spans.map((z, zi) => ({ col: z.startCol, count: vmCounts[zi] }));
+                      const vmNums = spans.map(() => []);
+                      for (let i = 0; i < 3; i++) { vmNums[i % nZones].push(i + 1); }
+                      return spans.map((z, zi) => ({ col: z.startCol, count: vmNums[zi].length, nums: vmNums[zi] }));
                     },
                     get dCols() { return Math.max(this.dClusters.length, 1); },
                     get dMultiClusterZone() {
@@ -2223,14 +2231,14 @@
                         <template x-if="dMode !== 'multiple'">
                           <div style="grid-column:1; display:flex; justify-content:center; align-items:center; padding:0.15rem 0;">
                             <template x-if="dHa">
-                              <div style="position:relative; width:5.3rem; height:2.7rem;">
-                                <div style="position:absolute; top:0.4rem; left:0.4rem; background:#fff; border:1.5px solid #333; border-radius:2px; font-size:0.62rem; font-weight:700; text-align:center; width:4.5rem; box-shadow:1px 1px 0 #aaa; padding:0.08rem 0.25rem;">Supervisor</div>
-                                <div style="position:absolute; top:0.2rem; left:0.2rem; background:#fff; border:1.5px solid #333; border-radius:2px; font-size:0.62rem; font-weight:700; text-align:center; width:4.5rem; box-shadow:1px 1px 0 #aaa; padding:0.08rem 0.25rem;">Supervisor</div>
-                                <div style="position:absolute; top:0;       left:0;       background:#fff; border:1.5px solid #333; border-radius:2px; font-size:0.62rem; font-weight:700; text-align:center; width:4.5rem; box-shadow:1px 1px 0 #aaa; padding:0.08rem 0.25rem;">Supervisor</div>
+                              <div style="position:relative; width:6.9rem; height:2.7rem;">
+                                <div style="position:absolute; top:0.4rem; left:0.4rem; background:#fff; border:1.5px solid #333; border-radius:2px; font-size:0.62rem; font-weight:700; text-align:center; width:6rem; box-shadow:1px 1px 0 #aaa; padding:0.08rem 0.25rem;">Supervisor-VMs</div>
+                                <div style="position:absolute; top:0.2rem; left:0.2rem; background:#fff; border:1.5px solid #333; border-radius:2px; font-size:0.62rem; font-weight:700; text-align:center; width:6rem; box-shadow:1px 1px 0 #aaa; padding:0.08rem 0.25rem;">Supervisor-VMs</div>
+                                <div style="position:absolute; top:0;       left:0;       background:#fff; border:1.5px solid #333; border-radius:2px; font-size:0.62rem; font-weight:700; text-align:center; width:6rem; box-shadow:1px 1px 0 #aaa; padding:0.08rem 0.25rem;">Supervisor-VMs</div>
                               </div>
                             </template>
                             <template x-if="!dHa">
-                              <div style="background:#fff; border:1.5px solid #333; border-radius:2px; padding:0.08rem 0.25rem; font-size:0.62rem; font-weight:700; text-align:center; width:4.5rem; box-shadow:1px 1px 0 #aaa;">Supervisor</div>
+                              <div style="background:#fff; border:1.5px solid #333; border-radius:2px; padding:0.08rem 0.25rem; font-size:0.62rem; font-weight:700; text-align:center; width:6rem; box-shadow:1px 1px 0 #aaa; white-space:nowrap;">Supervisor-VM1</div>
                             </template>
                           </div>
                         </template>
@@ -2238,8 +2246,8 @@
                         <template x-if="dMode === 'multiple'">
                           <template x-for="(p, pi) in dSupervisorPlacements" :key="'supp-'+pi">
                             <div :style="'grid-column:'+p.col+'; display:flex; flex-direction:column; justify-content:center; align-items:center; gap:0.3rem; padding:0.15rem 0;'">
-                              <template x-for="vi in p.count" :key="'vm-'+vi">
-                                <div style="background:#fff; border:1.5px solid #333; border-radius:2px; padding:0.08rem 0.25rem; font-size:0.62rem; font-weight:700; text-align:center; width:4.5rem; box-shadow:1px 1px 0 #aaa;">Supervisor</div>
+                              <template x-for="vn in p.nums" :key="'vm-'+vn">
+                                <div style="background:#fff; border:1.5px solid #333; border-radius:2px; padding:0.08rem 0.25rem; font-size:0.62rem; font-weight:700; text-align:center; width:6rem; box-shadow:1px 1px 0 #aaa; white-space:nowrap;" x-text="'Supervisor-VM'+vn"></div>
                               </template>
                             </div>
                           </template>
@@ -3601,7 +3609,7 @@
                 <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0.5rem;">
                   <span style="font-size:0.72rem; font-weight:600; color:#004980;">
                     <i class="fas fa-magic" style="margin-right:0.3rem;"></i>
-                    Also auto-fix S5-2, S5-3, S5-4
+                    Also auto-fix R6-2, R6-3, R6-4
                   </span>
                   <label style="display:flex; align-items:center; gap:0.35rem; cursor:pointer; user-select:none;">
                     <input type="checkbox" x-model="fixModal.cascade.enabled" style="width:1rem; height:1rem; cursor:pointer; accent-color:#0072a3;">
@@ -3611,9 +3619,9 @@
                 <!-- Steps list (only when enabled) -->
                 <template x-if="fixModal.cascade.enabled">
                   <ul style="margin:0; padding-left:1.1rem; font-size:0.7rem; color:#004980; line-height:1.8;">
-                    <li>S5-2 &nbsp;— Attach Distributed Transit Gateway to this connection</li>
+                    <li>R6-2 &nbsp;— Attach Distributed Transit Gateway to this connection</li>
                     <li>
-                      S5-3 &nbsp;— Create External IP Block <code>dist-ext-ip-block-1</code> (CIDR derived from gateway subnet)
+                      R6-3 &nbsp;— Create External IP Block <code>dist-ext-ip-block-1</code> (CIDR derived from gateway subnet)
                       <div style="margin-top:0.35rem; margin-left:1rem; padding-left:0.6rem; border-left:2px solid #b3d4f0;">
                         <label style="font-size:0.67rem; color:#004980; font-weight:600;">Excluded IP Ranges <span style="font-weight:normal; color:#5a6a7a;">(optional)</span></label>
                         <div class="clr-control-container" style="margin-top:0.15rem;"><div class="clr-input-wrapper">
@@ -3629,7 +3637,7 @@
                       </div>
                     </li>
                     <li>
-                      S5-4 &nbsp;— Configure VPC Connectivity Profile
+                      R6-4 &nbsp;— Configure VPC Connectivity Profile
                       <!-- VNA Cluster selector: only shown when there are 2+ clusters -->
                       <template x-if="fixModal.form.vna_clusters && fixModal.form.vna_clusters.length > 1">
                         <div style="margin-top:0.35rem; margin-left:1rem; padding-left:0.6rem; border-left:2px solid #b3d4f0;">
@@ -3644,7 +3652,7 @@
                         </div>
                       </template>
                       <template x-if="!fixModal.form.vna_clusters || fixModal.form.vna_clusters.length === 0">
-                        <span style="font-size:0.68rem; color:#b07d00;"> — ⚠ No VNA Cluster found, S5-4 will be skipped</span>
+                        <span style="font-size:0.68rem; color:#b07d00;"> — ⚠ No VNA Cluster found, R6-4 will be skipped</span>
                       </template>
                     </li>
                   </ul>
@@ -4113,7 +4121,7 @@
                       <i class="fas fa-circle" style="color:#ccc; margin-top:2px; flex-shrink:0;"></i>
                     </template>
                     <div style="flex:1;">
-                      <span style="font-size:0.8rem; font-weight:600;">S5-1 &nbsp;Distributed External Connection</span>
+                      <span style="font-size:0.8rem; font-weight:600;">R6-1 &nbsp;Distributed External Connection</span>
                       <template x-if="fixModal.result && !fixModal.result.success">
                         <pre style="font-size:0.68rem; background:#fae8e8; border-radius:3px; padding:0.4rem 0.6rem; color:#c21d00; white-space:pre-wrap; margin-top:0.25rem;" x-text="fixModal.result.error"></pre>
                       </template>
@@ -4157,7 +4165,7 @@
                         <span>All steps completed. Click <strong>Re-check Requirements</strong> to confirm everything is green.</span>
                       </template>
                       <template x-if="fixModal.cascade.steps.some(s => s.status === 'skipped')">
-                        <span style="color:#b07d00;">S5-1 to S5-3 completed. Complete the skipped step(s) manually, then click <strong>Re-check Requirements</strong>.</span>
+                        <span style="color:#b07d00;">R6-1 to R6-3 completed. Complete the skipped step(s) manually, then click <strong>Re-check Requirements</strong>.</span>
                       </template>
                     </p>
                   </template>
@@ -5565,7 +5573,7 @@
       topoNsx: null,   // cached raw NSX topology response for reuse in other panels
 
       showDiagram: false, // lightbox for architecture diagram
-      diagImg: '/static/nsx-vpc-distributed.jpg?v=4',
+      diagImg: '/static/nsx-vpc-distributed.jpg?v=6',
       diagDrag: { active: false, offsetX: 0, offsetY: 0, x: null, y: null },
 
       // ── Install Wizard ─────────────────────────────────────────────────
@@ -7365,10 +7373,10 @@
 
           if (!tgwPath) {
             cascade.steps[2].status = 'fail';
-            cascade.steps[2].error  = 'No Distributed TGW found after S5-2. Please wait and re-check.';
+            cascade.steps[2].error  = 'No Distributed TGW found after R6-2. Please wait and re-check.';
           } else if (!clPath) {
             cascade.steps[2].status = 'skipped';
-            cascade.steps[2].error  = 'No VNA Cluster selected. Complete the S4 fix first, then run the S5-4 Fix wizard.';
+            cascade.steps[2].error  = 'No VNA Cluster selected. Complete the R5 fix first, then run the R6-4 Fix wizard.';
           } else {
             const r4 = await fetch('/api/fix/configure-vpc-profile', {method:'POST', headers:hdr,
               body: JSON.stringify({
@@ -7797,9 +7805,11 @@
         const cluster = this.vnaWizard.form.cluster_moref;
         const map     = opts.cluster_ds_map || {};
         const validDs = map[cluster];
-        let   cands   = (validDs && validDs.length)
-                         ? (opts.datastores || []).filter(d => validDs.includes(d.datastore))
-                         : (opts.datastores || []);
+        // Exact per-cluster list from the backend (SOAP host → datastores).
+        if (Array.isArray(validDs))
+          return (opts.datastores || []).filter(d => validDs.includes(d.datastore));
+        // No exact data for this cluster: fall back to all datastores + name heuristic.
+        let   cands   = (opts.datastores || []);
         if (cands.length <= 1) return cands;
 
         // Narrow by cluster name trailing suffix (e.g. "01a" → datastores containing "01a")
@@ -7887,6 +7897,10 @@
             this.vnaWizard.form.gateway = d.vc_gateway || '';
             this.vnaWizard.form.dns     = (d.vc_dns || []).join(', ');
             this.vnaWizard.form.ntp     = (d.vc_ntp || []).join(', ');
+            // Make sure the pre-selected datastore is one the selected cluster can see
+            const _dss = this.vnaFilteredDatastores();
+            if (!_dss.some(x => x.datastore === this.vnaWizard.form.datastore_id))
+              this.vnaWizard.form.datastore_id = _dss.length ? _dss[0].datastore : '';
           }
         } catch(e) {
           this.vnaWizard.options = {success: false, error: String(e)};

@@ -70,7 +70,9 @@ The tool queries vCenter and NSX and displays a **3-column summary** (one card p
 
 Each card shows:
 - An architecture **thumbnail** for each mode — click it to open a draggable full-size diagram overlay
-- **Pros / Cons / Requirements** text
+- **Pros / Cons / Requirements** text — key highlights per mode:
+  - **NSX-VPC Distributed / Centralized**: More scale (K8s nodes use logical private IPs, fewer public IPs consumed); Best high-availability (simple distribution of Supervisor VMs across vSphere Clusters)
+  - **VDS / FLB**: No VCF-Automation support; Less scale (all VMs and VKS nodes consume public IPs); Less high-availability (distributing Supervisor VMs across clusters is challenging)
 - A **status chip** summarising the overall result: Ready / Warnings / Missing Reqs / To Validate — or a blue **"In Use"** chip if Supervisor is already installed in that mode
 - A **"View Requirement Steps"** radio button in the footer — click it to expand the full-width steps panel for that mode
 - A **Deploy** button (enabled only when all steps are green)
@@ -112,10 +114,10 @@ Most steps show a small **"Open in vCenter"** link button below the step title. 
 | R3 — NSX Host Preparation | Cluster > Configure > Networking > Network Configuration for each cluster |
 | R4 Distributed | NSX VNA Clusters page |
 | R4 Centralized | NSX Edge Clusters page |
-| R5-1 | External Connections page |
-| R5-2 | Transit Gateway detail page (jumps to the specific TGW found by the check) |
-| R5-3 | VPC > Configure > IP Blocks |
-| R5-4 | VPC > Configure > Connectivity Profile — **or** "Open in NSX (VPC Conn. Prof.)" with a project-switch hint when the valid profile is in a non-default NSX project |
+| R6-1 | External Connections page |
+| R6-2 | Transit Gateway detail page (jumps to the specific TGW found by the check) |
+| R6-3 | VPC > Configure > IP Blocks |
+| R6-4 | VPC > Configure > Connectivity Profile — **or** "Open in NSX (VPC Conn. Prof.)" with a project-switch hint when the valid profile is in a non-default NSX project |
 
 ### Check MTU Button
 
@@ -133,7 +135,7 @@ If any tunnel shows as failed, the physical switch ports or vDS uplinks MTU need
 
 ### Check Ext. Conn. Button
 
-Once **R5-1 through R5-4 are all green**, a **"Check Ext. Conn."** button appears on R5-1 in the Distributed steps panel. Use it to verify that the DVLAN VLAN ID is correctly configured end-to-end on every ESX host before deploying Supervisor.
+Once **R6-1 through R6-4 are all green**, a **"Check Ext. Conn."** button appears on R6-1 in the Distributed steps panel. Use it to verify that the DVLAN VLAN ID is correctly configured end-to-end on every ESX host before deploying Supervisor.
 
 Clicking it opens a wizard that:
 1. Shows all ESX hosts; prompts for the root password (entering the first password copies it to all hosts)
@@ -157,12 +159,12 @@ The following steps have automated Fix wizards:
 |---|---|---|
 | R2 — vSphere HA / DRS | All | Enables HA and sets DRS to Fully Automated on the cluster via vCenter SOAP |
 | R4 — VNA Cluster | Distributed | Deploys a 2-node VNA cluster on the WLD vCenter cluster |
-| R5-1 — Distributed External Connection | Distributed | Creates a Distributed VLAN Connection in NSX |
-| R5-1 — Centralized External Connection | Centralized | Creates a Gateway Connection (Tier-0 + BGP required first) |
-| R5-2 — Distributed Transit Gateway | Distributed | Attaches the Default TGW to a DVLAN connection, or creates a new Distributed TGW |
-| R5-2 — Centralized Transit Gateway | Centralized | Attaches the Default TGW to a Gateway Connection, or creates a new Centralized TGW |
-| R5-3 — External IP Block | Distributed + Centralized | Creates an NSX External IP Block |
-| R5-4 — VPC Connectivity Profile | Distributed + Centralized | Creates or updates the VPC Connectivity Profile in the NSX Default Project |
+| R6-1 — Distributed External Connection | Distributed | Creates a Distributed VLAN Connection in NSX |
+| R6-1 — Centralized External Connection | Centralized | Creates a Gateway Connection (Tier-0 + BGP required first) |
+| R6-2 — Distributed Transit Gateway | Distributed | Attaches the Default TGW to a DVLAN connection, or creates a new Distributed TGW |
+| R6-2 — Centralized Transit Gateway | Centralized | Attaches the Default TGW to a Gateway Connection, or creates a new Centralized TGW |
+| R6-3 — External IP Block | Distributed + Centralized | Creates an NSX External IP Block |
+| R6-4 — VPC Connectivity Profile | Distributed + Centralized | Creates or updates the VPC Connectivity Profile in the NSX Default Project |
 
 #### VNA Cluster Deployment (R4 Distributed)
 
@@ -183,18 +185,18 @@ When you click **Fix** on R4 Distributed, a 3-step wizard opens:
 
 After clicking Deploy, the wizard shows live progress (polled every 30 seconds). Deployment typically takes 15–20 minutes.
 
-#### Cascade Fix (R5-1 Distributed)
+#### Cascade Fix (R6-1 Distributed)
 
-The R5-1 Distributed External Connection fix wizard includes an optional **"Also auto-fix R5-2, R5-3, R5-4"** checkbox. When enabled, after creating the DVLAN connection the tool automatically:
-1. Attaches the Transit Gateway to the new connection (R5-2)
-2. Creates an External IP Block using the connection's subnet (R5-3)
-3. Configures the VPC Connectivity Profile (R5-4)
+The R6-1 Distributed External Connection fix wizard includes an optional **"Also auto-fix R6-2, R6-3, R6-4"** checkbox. When enabled, after creating the DVLAN connection the tool automatically:
+1. Attaches the Transit Gateway to the new connection (R6-2)
+2. Creates an External IP Block using the connection's subnet (R6-3)
+3. Configures the VPC Connectivity Profile (R6-4)
 
-Each sub-step is shown with its own progress row. Steps that cannot complete (e.g. R5-4 is skipped if no VNA Cluster exists yet) are marked as skipped with a warning message.
+Each sub-step is shown with its own progress row. Steps that cannot complete (e.g. R6-4 is skipped if no VNA Cluster exists yet) are marked as skipped with a warning message.
 
-#### VPC Connectivity Profile (R5-4 Distributed)
+#### VPC Connectivity Profile (R6-4 Distributed)
 
-The R5-4 fix wizard auto-populates fields from data already discovered during the requirements check:
+The R6-4 fix wizard auto-populates fields from data already discovered during the requirements check:
 
 - **NSX Project** — defaults to "Default"; refreshes the profile list if changed
 - **Distributed Transit Gateway** — auto-selected if only one exists
@@ -272,6 +274,8 @@ When the Supervisor management vNIC should be placed on a VPC Public subnet inst
    - **Static** — enter the first control-plane IP manually.
    - **DHCP** — IPs are assigned by DHCP. The tool calls `/api/check-vpc-subnet-dhcp` to verify that DHCP is enabled on the selected subnet; an error is shown if DHCP is not configured.
 
+When deploying, the tool automatically resolves each VPC Public subnet to its **vCenter distributed port-group moref** via the NSX realized-state API (`RealizedLogicalSwitchDvpg` entity), so the vCenter Supervisor API receives the correct port-group reference — not the NSX subnet path. If NSX realized state is not yet available, it falls back to a unique port-group name match.
+
 > **Note:** "Check Network Connectivity" is not available in VPC Public mode — the button is shown as greyed-out.
 
 ### Optional: Check Network Connectivity
@@ -305,6 +309,8 @@ Select storage policies for three independent Supervisor storage tiers. Each tie
 | **Image Cache** | Storage policy for the container image cache layer |
 
 All three default to the same policy; change individual tiers when your environment has dedicated policies per workload type.
+
+> **Datastore detection**: the compatible datastore list is built via SOAP `PropertyCollector` (per-host datastore enumeration, then intersected per cluster) rather than the vCenter REST `filter.hosts` parameter, which is unreliable on some vCenter versions.
 
 ### Wizard Step 4 — Config
 
