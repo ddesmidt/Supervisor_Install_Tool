@@ -40,6 +40,20 @@ At the top of the page, fill in the two connection sections:
 
 ---
 
+
+### Optional: VMware Avi Load Balancer (NSX ALB)
+
+When you connect to vCenter and NSX, the tool automatically checks NSX for an integrated **VMware Avi Load Balancer**:
+
+- **Not detected in NSX**: The **Load Balancing Service offered by AVI** banner under **Deployment Options** stays muted (`Not detected in NSX`), and native NSX Load Balancing topology diagrams are displayed.
+- **Detected in NSX**: The banner highlights AVI detection, automatically switches the **NSX-VPC Distributed** and **NSX-VPC Centralized** architecture diagrams to the AVI-enabled variants, and reveals the **AVI Load Balancer** credential panel:
+
+| Field | Example | Notes |
+|---|---|---|
+| AVI Controller IP / FQDN | `avi-ctrl-a.site-a.vcf.lab` | Auto-populated from NSX discovery when available |
+| AVI Username | `admin` | Pre-filled |
+| AVI Password | `VMware123!VMware123!` | Required to run **Validate AVI Credentials** and checks `R7-1` / `R7-2` |
+
 ## Step 2 — Check if Supervisor is Already Installed
 
 Click **"Check if Supervisor is Installed"**.

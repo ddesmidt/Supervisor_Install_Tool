@@ -71,6 +71,490 @@ def _block_cidr(b: dict, nsx_url: str = "", user: str = "", pwd: str = "") -> st
     return cidr
 
 
+
+def _norm_host(raw: str) -> str:
+    if not raw:
+        return ""
+    val = raw.strip()
+    if "://" not in val:
+        val = "https://" + val
+    return (urlparse(val).hostname or "").strip().lower()
+
+
+def _hosts_match(target: str, candidate: str) -> bool:
+    if not target or not candidate:
+        return False
+    if target == candidate:
+        return True
+    try:
+        return socket.gethostbyname(target) == socket.gethostbyname(candidate)
+    except Exception:
+        return False
+
+
+def _extract_fqdn_from_pem(pem: str, match_ip: str = "") -> str:
+    import re as _re
+    import subprocess as _sp
+    if not pem:
+        return ""
+    try:
+        out = _sp.check_output(
+            ["openssl", "x509", "-noout", "-subject", "-ext", "subjectAltName"],
+            input=pem.encode(),
+            stderr=_sp.DEVNULL,
+            timeout=3,
+        ).decode(errors="ignore")
+        if match_ip and f"IP Address:{match_ip}" not in out and f"IP:{match_ip}" not in out:
+            return ""
+        for dns_name in _re.findall(r"DNS:([^,\s]+)", out):
+            d_clean = dns_name.strip()
+            if "." in d_clean and not d_clean.startswith("*") and not d_clean.lower().endswith(".local"):
+                return d_clean
+        m_cn = _re.search(r"CN\s*=\s*([^,/\n]+)", out)
+        if m_cn:
+            cn_clean = m_cn.group(1).strip()
+            if "." in cn_clean and not cn_clean.lower().endswith(".local"):
+                return cn_clean
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_ip_to_fqdn(ip_str: str) -> str:
+    # Resolve an IPv4 address to an FQDN via reverse DNS, falling back to TLS certificate SAN/CN.
+    try:
+        fqdn = socket.gethostbyaddr(ip_str)[0].rstrip(".")
+        if fqdn and fqdn != ip_str and "." in fqdn and not fqdn.lower().endswith(".local"):
+            return fqdn
+    except Exception:
+        pass
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((ip_str, 443), timeout=3) as raw_sock:
+            with ctx.wrap_socket(raw_sock, server_hostname=ip_str) as tls_sock:
+                der = tls_sock.getpeercert(binary_form=True)
+                if der:
+                    pem = ssl.DER_cert_to_PEM_cert(der)
+                    fqdn = _extract_fqdn_from_pem(pem)
+                    if fqdn:
+                        return fqdn
+    except Exception:
+        pass
+    return ip_str
+
+
+def _discover_avi_from_nsx(nsx_url: str, nsx_user: str, nsx_pass: str) -> dict:
+    # Detect whether Avi Load Balancer is registered in NSX and resolve its Controller FQDN/IP.
+    info = {"detected": False, "avi_url": "", "avi_ip": "", "source": ""}
+    if not nsx_url:
+        return info
+
+    # 1. Check Avi-created NSX Policy objects (e.g., ControllerCluster IP Group tagged AVICLOUD_UUID)
+    try:
+        srch = nsx_get(nsx_url, nsx_user, nsx_pass, "/policy/api/v1/search?query=tags.tag:AVICLOUD_UUID") or {}
+        results = srch.get("results") or []
+        if results:
+            info["detected"] = True
+            info["source"] = "NSX Cloud"
+            for r in results:
+                if r.get("resource_type") == "Group" and "ControllerCluster" in (r.get("display_name") or r.get("id") or ""):
+                    for expr in (r.get("expression") or []):
+                        ips = expr.get("ip_addresses") or []
+                        if ips:
+                            info["avi_ip"] = str(ips[0]).strip()
+                            break
+                if info["avi_ip"]:
+                    break
+    except Exception:
+        pass
+
+    # 2. Check NSX Certificates (e.g., AVI-Portal-Cert-<ip>-Pinned) matching Controller IP or Portal cert
+    try:
+        certs = nsx_get(nsx_url, nsx_user, nsx_pass, "/api/v1/trust-management/certificates") or {}
+        for cert in (certs.get("results") or []):
+            cname = (cert.get("display_name") or cert.get("id") or "")
+            pem = cert.get("pem_encoded") or ""
+            if info["avi_ip"]:
+                fqdn = _extract_fqdn_from_pem(pem, match_ip=info["avi_ip"])
+                if fqdn:
+                    info["detected"] = True
+                    info["avi_url"] = fqdn
+                    return info
+            elif "avi-portal" in cname.lower() or "avi" in cname.lower():
+                fqdn = _extract_fqdn_from_pem(pem)
+                if fqdn:
+                    info["detected"] = True
+                    info["avi_url"] = fqdn
+                    if not info["source"]:
+                        info["source"] = "NSX Certificate"
+                    return info
+    except Exception:
+        pass
+
+    # 3. Check NSX Principal Identities for registered Avi/ALB node identities
+    if not info["detected"]:
+        try:
+            pis = nsx_get(nsx_url, nsx_user, nsx_pass, "/api/v1/trust-management/principal-identities") or {}
+            for pi in (pis.get("results") or []):
+                blob = f"{pi.get('name','')} {pi.get('display_name','')} {pi.get('_create_user','')}".lower()
+                if "alb" in blob or "avi" in blob:
+                    info["detected"] = True
+                    info["source"] = "NSX Principal Identity"
+                    break
+        except Exception:
+            pass
+
+    if info["avi_ip"] and not info["avi_url"]:
+        info["avi_url"] = _resolve_ip_to_fqdn(info["avi_ip"])
+
+    return info
+
+
+def _check_avi_readiness(
+    avi_url_raw: str,
+    avi_user: str,
+    avi_pass: str,
+    target_nsx_url: str = "",
+    target_vc_url: str = "",
+) -> dict:
+    # Authenticate to VMware Avi Load Balancer and validate Licensing + matching NSX Cloud status.
+    nl = chr(10)
+    res = {
+        "auth_ok": False,
+        "auth_fail_kind": "unreachable",
+        "auth_error": "",
+        "auth_details": "",
+        "avi_url": "",
+        "avi_host": "",
+        "version": "",
+        "cluster_state": "",
+        "license_ok": False,
+        "license_warn_reason": "",
+        "license_tier": "",
+        "license_summary": "",
+        "license_details": "",
+        "nsx_cloud_ok": False,
+        "nsx_cloud_msg": "",
+        "nsx_cloud_details": "",
+    }
+    if not avi_url_raw:
+        res["auth_error"] = "AVI Controller IP / FQDN is missing — enter it in the AVI section above"
+        res["auth_details"] = "No AVI Controller IP or FQDN was provided."
+        return res
+
+    avi_url = normalize_url(avi_url_raw)
+    avi_host = urlparse(avi_url).hostname or avi_url_raw
+    res["avi_url"] = avi_url
+    res["avi_host"] = avi_host
+    user = (avi_user or "admin").strip()
+    pwd = avi_pass or ""
+    if not pwd:
+        res["auth_fail_kind"] = "credentials"
+        res["auth_error"] = f"AVI password is missing for user '{user}'"
+        res["auth_details"] = f"Controller URL: {avi_url}{nl}User: {user}"
+        return res
+
+    sess = requests.Session()
+    sess.verify = False
+    try:
+        r = sess.post(
+            f"{avi_url}/login",
+            data={"username": user, "password": pwd},
+            timeout=10,
+        )
+    except Exception as e:
+        err_s = str(e)
+        res["auth_fail_kind"] = "unreachable"
+        if "NameResolutionError" in err_s or "Name or service not known" in err_s or "nodename nor servname" in err_s:
+            res["auth_error"] = f"Cannot reach AVI Controller '{avi_host}' — DNS resolution failed (check FQDN or DNS)"
+        elif "ConnectTimeout" in err_s or "timed out" in err_s.lower():
+            res["auth_error"] = f"Cannot reach AVI Controller '{avi_host}' — connection timed out (verify IP/FQDN and firewall)"
+        elif "ConnectionRefusedError" in err_s or "Connection refused" in err_s:
+            res["auth_error"] = f"Cannot reach AVI Controller '{avi_host}' — connection refused on port 443"
+        else:
+            res["auth_error"] = f"Cannot reach AVI Controller '{avi_host}' — verify IP/FQDN and network connectivity"
+        res["auth_details"] = f"Controller URL: {avi_url}{nl}Technical Error: {err_s}"
+        return res
+
+    if r.status_code in (401, 403):
+        res["auth_fail_kind"] = "credentials"
+        res["auth_error"] = f"Authentication failed on '{avi_host}' for user '{user}' — invalid username or password"
+        res["auth_details"] = f"Controller URL: {avi_url}{nl}User: {user}{nl}HTTP Status: {r.status_code}"
+        return res
+    if r.status_code != 200:
+        res["auth_fail_kind"] = "credentials"
+        res["auth_error"] = f"Login to AVI Controller '{avi_host}' failed (HTTP {r.status_code})"
+        res["auth_details"] = f"Controller URL: {avi_url}{nl}User: {user}{nl}HTTP Status: {r.status_code}"
+        return res
+
+    try:
+        login_data = r.json()
+    except Exception:
+        login_data = {}
+
+    version = (login_data.get("version") or {}).get("Version") or "30.2.1"
+    csrf = sess.cookies.get("csrftoken", "")
+    headers = {
+        "X-CSRFToken": csrf,
+        "X-Avi-Version": version,
+        "Referer": avi_url,
+        "Content-Type": "application/json",
+    }
+    res["auth_ok"] = True
+    res["version"] = version
+
+    def avi_get(path: str) -> dict:
+        resp = sess.get(f"{avi_url}{path}", headers=headers, timeout=12)
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        crt = avi_get("/api/cluster/runtime")
+        res["cluster_state"] = (crt.get("cluster_state") or {}).get("state", "UNKNOWN")
+    except Exception:
+        res["cluster_state"] = "UNKNOWN"
+
+    try:
+        sys_cfg = avi_get("/api/systemconfiguration")
+        tier = sys_cfg.get("default_license_tier") or "UNKNOWN"
+        res["license_tier"] = tier
+
+        lic_status = {}
+        try:
+            lic_status = avi_get("/api/licensing/status")
+        except Exception:
+            lic_status = {}
+
+        lic_ctrl = {}
+        try:
+            lic_ctrl = avi_get("/api/licensing")
+        except Exception:
+            lic_ctrl = {}
+
+        saas = lic_status.get("saas_status") or {}
+        cls = lic_status.get("cls_status") or {}
+        svc_units = (lic_status.get("service_update") or {}).get("service_units") or {}
+        saas_pool = saas.get("pool") or {}
+
+        avail_units = float(
+            saas_pool.get("available_service_units")
+            or svc_units.get("available_service_units")
+            or 0
+        )
+        used_units = float(
+            saas_pool.get("used_service_units")
+            or svc_units.get("used_service_units")
+            or 0
+        )
+
+        saas_connected = bool(saas.get("enabled") and saas.get("connected") and not saas.get("expired"))
+        cls_connected = bool(cls.get("enabled") and cls.get("connected"))
+        cloud_lic_state = saas.get("state") or ("CONNECTED" if cls_connected else "")
+        cloud_lic_msg = saas.get("message") or cls.get("message") or ""
+
+        active_licenses = lic_ctrl.get("licenses") or []
+        lic_names = [
+            f"{l.get('license_name', 'License')} ({l.get('tier_type', tier)}, {l.get('cores', 0):g} cores)"
+            for l in active_licenses
+        ]
+        ent_licenses = [
+            l for l in active_licenses
+            if "ENTERPRISE" in str(l.get("tier_type") or tier).upper() and float(l.get("cores") or 0) > 0
+        ]
+
+        tier_upper = tier.upper()
+        is_enterprise = "ENTERPRISE" in tier_upper
+        has_valid_license = (
+            (saas_connected and avail_units > 0)
+            or (cls_connected and avail_units > 0)
+            or (len(ent_licenses) > 0)
+        )
+
+        detail_lines = [
+            f"Controller: {avi_url} (Version {version}, Cluster: {res['cluster_state']})",
+            f"Default License Tier: {tier}",
+        ]
+        if saas.get("enabled"):
+            detail_lines.append(
+                f"Cloud Licensing (Pulse): {'Connected' if saas_connected else 'Disconnected'} ({cloud_lic_state})"
+            )
+            if cloud_lic_msg:
+                detail_lines.append(f"Portal Status: {cloud_lic_msg}")
+        elif cls.get("enabled"):
+            detail_lines.append(f"CLS Licensing: {'Connected' if cls_connected else 'Disconnected'}")
+        if avail_units or used_units:
+            detail_lines.append(f"License Pool: {used_units:g} used / {avail_units:g} available service units")
+        if lic_names:
+            detail_lines.append(f"Installed/Leased Licenses: {', '.join(lic_names)}")
+        else:
+            detail_lines.append("Installed/Leased Licenses: none")
+        res["license_details"] = nl.join(detail_lines)
+
+        if not is_enterprise:
+            res["license_ok"] = False
+            res["license_warn_reason"] = (
+                f"Authenticated to '{avi_host}', but license tier is '{tier}' — Enterprise tier is required for Supervisor"
+            )
+        elif saas.get("enabled") and not saas_connected and avail_units <= 0 and not ent_licenses:
+            res["license_ok"] = False
+            res["license_warn_reason"] = (
+                f"Authenticated to '{avi_host}', but no active license was found (Cloud Licensing is disconnected/expired)"
+            )
+        elif not has_valid_license:
+            res["license_ok"] = False
+            res["license_warn_reason"] = (
+                f"Authenticated to '{avi_host}', but no active license or available capacity was found (Tier: {tier})"
+            )
+        else:
+            res["license_ok"] = True
+            res["license_summary"] = f"Authenticated to {avi_url} — {tier}"
+    except Exception as e:
+        res["license_ok"] = False
+        res["license_warn_reason"] = f"Authenticated to '{avi_host}', but could not verify licensing: {e}"
+        res["license_details"] = f"Controller: {avi_url} (Version {version}){nl}Error: {e}"
+
+    try:
+        clouds_resp = avi_get("/api/cloud")
+        all_clouds = clouds_resp.get("results") or []
+        nsx_clouds = [c for c in all_clouds if c.get("vtype") == "CLOUD_NSXT"]
+        if not nsx_clouds:
+            res["nsx_cloud_ok"] = False
+            res["nsx_cloud_msg"] = f"No NSX Cloud connector (CLOUD_NSXT) is configured on '{avi_host}'"
+            res["nsx_cloud_details"] = (
+                f"Configured clouds ({len(all_clouds)}): "
+                + (", ".join(f"{c.get('name')} ({c.get('vtype')})" for c in all_clouds) or "none")
+                + f"{nl}An NSX Cloud connector (CLOUD_NSXT) in Green/Ready state is required."
+            )
+            return res
+
+        # Map each cloud UUID to its linked vCenter server(s) via /api/vcenterserver
+        cloud_vcs = {}
+        try:
+            vc_resp = avi_get("/api/vcenterserver")
+            for vc_obj in (vc_resp.get("results") or []):
+                cref = vc_obj.get("cloud_ref") or ""
+                cuuid_ref = cref.rstrip("/").split("/")[-1] if cref else ""
+                vchost = _norm_host(vc_obj.get("vcenter_url") or vc_obj.get("name") or "")
+                if cuuid_ref and vchost:
+                    cloud_vcs.setdefault(cuuid_ref, []).append(vchost)
+        except Exception:
+            pass
+
+        target_nsx_host = _norm_host(target_nsx_url)
+        target_vc_host = _norm_host(target_vc_url)
+
+        state_labels = {
+            "CLOUD_STATE_FAILED": "Failed / Red",
+            "CLOUD_STATE_IN_PROGRESS": "Initializing / Not Ready",
+            "CLOUD_STATE_DEGRADED": "Degraded",
+            "CLOUD_STATE_DISCONNECTED": "Disconnected",
+        }
+
+        cloud_reports = []
+        evaluated = []
+        for c in nsx_clouds:
+            cname = c.get("name", "?")
+            cuuid = c.get("uuid", "")
+            nsxt_cfg = c.get("nsxt_configuration") or {}
+            nsxt_raw = nsxt_cfg.get("nsxt_url") or ""
+            nsxt_host = _norm_host(nsxt_raw)
+            vpc_mode = nsxt_cfg.get("vpc_mode", False)
+            linked_vcs = cloud_vcs.get(cuuid, [])
+
+            state = "UNKNOWN"
+            reason = ""
+            try:
+                st = avi_get(f"/api/cloud/{cuuid}/status")
+                state = st.get("state") or "UNKNOWN"
+                reason = st.get("reason") or ""
+            except Exception as se:
+                state = "ERROR"
+                reason = str(se)
+
+            nsx_matched = _hosts_match(target_nsx_host, nsxt_host)
+            vc_matched = any(_hosts_match(target_vc_host, v) for v in linked_vcs)
+
+            vc_disp = ", ".join(linked_vcs) if linked_vcs else "none"
+            detail_parts = [
+                f"· {cname} ({cuuid}): {state}",
+                f"  . NSX: {nsxt_raw or '?'}",
+                f"  . vCenter: {vc_disp}",
+                f"  . VPC Mode: {vpc_mode}",
+            ]
+            if reason:
+                detail_parts.append(f"  . Reason: {reason}")
+            cloud_reports.append(nl.join(detail_parts))
+
+            evaluated.append({
+                "name": cname,
+                "uuid": cuuid,
+                "nsxt_raw": nsxt_raw,
+                "nsxt_host": nsxt_host,
+                "linked_vcs": linked_vcs,
+                "state": state,
+                "reason": reason,
+                "nsx_matched": nsx_matched,
+                "vc_matched": vc_matched,
+            })
+
+        res["nsx_cloud_details"] = nl.join(cloud_reports)
+
+        # Strictly match against provided NSX Manager and vCenter Server
+        if target_nsx_host and target_vc_host:
+            candidates = [e for e in evaluated if e["nsx_matched"] and e["vc_matched"]]
+            if not candidates:
+                # Allow NSX match only if the cloud has no vCenter object linked yet in AVI
+                candidates = [e for e in evaluated if e["nsx_matched"] and not e["linked_vcs"]]
+        elif target_nsx_host:
+            candidates = [e for e in evaluated if e["nsx_matched"]]
+        elif target_vc_host:
+            candidates = [e for e in evaluated if e["vc_matched"]]
+        else:
+            candidates = evaluated
+
+        if not candidates:
+            target_desc_parts = []
+            if target_nsx_host:
+                target_desc_parts.append(f"NSX '{target_nsx_host}'")
+            if target_vc_host:
+                target_desc_parts.append(f"vCenter '{target_vc_host}'")
+            target_desc = " / ".join(target_desc_parts)
+            avail_summary = ", ".join(
+                f"{e['name']} (NSX: {e['nsxt_raw'] or '?'}, vCenter: {', '.join(e['linked_vcs']) or 'none'})"
+                for e in evaluated
+            )
+            res["nsx_cloud_ok"] = False
+            res["nsx_cloud_msg"] = (
+                f"No NSX Cloud connector on '{avi_host}' matches {target_desc} "
+                f"(configured: {avail_summary})"
+            )
+            return res
+
+        # If multiple clouds match the same NSX/vCenter, prefer one that is READY
+        ready_candidates = [e for e in candidates if e["state"] == "CLOUD_STATE_PLACEMENT_READY"]
+        chosen = ready_candidates[0] if ready_candidates else candidates[0]
+
+        if chosen["state"] == "CLOUD_STATE_PLACEMENT_READY":
+            res["nsx_cloud_ok"] = True
+            res["nsx_cloud_msg"] = f"NSX Cloud '{chosen['name']}' is Green"
+        else:
+            human_state = state_labels.get(chosen["state"], chosen["state"])
+            reason_suffix = f" — {chosen['reason']}" if chosen["reason"] else ""
+            res["nsx_cloud_ok"] = False
+            res["nsx_cloud_msg"] = (
+                f"NSX Cloud '{chosen['name']}' (for {chosen['nsxt_raw'] or target_nsx_host}) "
+                f"is {human_state} ({chosen['state']}){reason_suffix}"
+            )
+    except Exception as e:
+        res["nsx_cloud_ok"] = False
+        res["nsx_cloud_msg"] = f"Failed to query NSX Cloud connectors on '{avi_host}'"
+        res["nsx_cloud_details"] = str(e)
+
+    return res
+
+
 def normalize_url(url: str) -> str:
     url = url.strip().rstrip("/")
     if not url.startswith("http"):
@@ -161,6 +645,27 @@ def _vapi_zone_cluster_add(vc_url: str, session_token: str,
             )
     except (AttributeError, TypeError):
         pass  # If response shape differs, the HTTP 200 is sufficient
+
+
+def _format_vc_error(exc: Exception, vc_url: str = "", username: str = "") -> str:
+    host = urlparse(vc_url).hostname or vc_url or "vCenter"
+    user_part = f" for user '{username}'" if username else ""
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        code = exc.response.status_code
+        body_txt = exc.response.text or ""
+        if code == 401 or "UNAUTHENTICATED" in body_txt:
+            return f"Authentication failed on '{host}'{user_part} — invalid username or password."
+        if code == 403 or "UNAUTHORIZED" in body_txt:
+            return f"Access denied on '{host}'{user_part} — user does not have required vCenter permissions."
+        return f"vCenter '{host}' returned HTTP {code}: {body_txt[:200]}"
+    err_s = str(exc)
+    if "NameResolutionError" in err_s or "Name or service not known" in err_s or "nodename nor servname" in err_s:
+        return f"Cannot reach vCenter '{host}' — DNS resolution failed (check FQDN or DNS)."
+    if "ConnectTimeout" in err_s or "timed out" in err_s.lower():
+        return f"Cannot reach vCenter '{host}' — connection timed out (verify IP/FQDN and network)."
+    if "ConnectionRefusedError" in err_s or "Connection refused" in err_s:
+        return f"Cannot reach vCenter '{host}' — connection refused on port 443."
+    return err_s
 
 
 def vc_auth(vc_url: str, username: str, password: str) -> tuple[str, str]:
@@ -643,13 +1148,18 @@ def check_installed():
                 c["network_mode"] = np or "Unknown"
                 c["network_mode_warning"] = None
 
+        avi_disc = {"detected": False, "avi_url": "", "avi_ip": "", "source": ""}
+        if nsx_url:
+            try:
+                avi_disc = _discover_avi_from_nsx(nsx_url, nsx_user, nsx_pass)
+            except Exception:
+                pass
         result.update(success=True, installed=bool(enriched), clusters=enriched,
-                      capability=capability, auth_user=effective_user)
+                      capability=capability, auth_user=effective_user,
+                      avi_discovery=avi_disc)
 
-    except requests.HTTPError as e:
-        result["error"] = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
     except Exception as e:
-        result["error"] = str(e)
+        result["error"] = _format_vc_error(e, vc_url, username)
 
     return jsonify(result)
 
@@ -664,6 +1174,10 @@ def check_requirements():
     nsx_url  = normalize_url(nsx_url_raw) if nsx_url_raw else guess_nsx_url(vc_url)
     nsx_user = body.get("nsx_user") or "admin"
     nsx_pass = body.get("nsx_pass") or password
+    avi_enabled = bool(body.get("avi_enabled"))
+    avi_url_raw = (body.get("avi_url") or "").strip()
+    avi_user    = (body.get("avi_user") or "admin").strip()
+    avi_pass    = (body.get("avi_pass") or "").strip()
 
     # ── Phase 1: collect all raw data (single API pass) ──────────────────────
     d: dict = {}
@@ -673,7 +1187,7 @@ def check_requirements():
         d["vc_auth_ok"] = True
     except Exception as e:
         d["vc_auth_ok"] = False
-        d["vc_auth_error"] = str(e)
+        d["vc_auth_error"] = _format_vc_error(e, vc_url, username)
 
     if d.get("vc_auth_ok"):
         try:
@@ -945,6 +1459,9 @@ def check_requirements():
                              if v.get("_proj_id") == "default" and v.get("id") == "default"), None)
         except Exception as e:
             d["all_vcps"] = []; d["vcp"] = None; d["vcp_error"] = str(e)
+
+    if avi_enabled:
+        d["avi"] = _check_avi_readiness(avi_url_raw, avi_user, avi_pass, nsx_url or "", vc_url or "")
 
     # ── Phase 2: build per-mode check lists ──────────────────────────────────
 
@@ -1653,9 +2170,41 @@ def check_requirements():
                         + "\n\nThose are missing and this tool will guide you through this configuration.",
                         can_fix=True)
 
+        # ── Step R7: AVI Load Balancer (when enabled in Deployment Options) ──
+        if avi_enabled and mode in ("distributed", "centralized"):
+            avi = d.get("avi") or {}
+            if not avi.get("auth_ok"):
+                add("7-1", "AVI Authentication + Licensing", "error",
+                    avi.get("auth_error") or "AVI authentication failed",
+                    avi.get("auth_details") or f"Target: {avi.get('avi_url') or avi_url_raw or '(not set)'}")
+                r7_2_skip = (
+                    "Cannot verify NSX Cloud — AVI Controller is unreachable"
+                    if avi.get("auth_fail_kind") == "unreachable"
+                    else "Cannot verify NSX Cloud — AVI login failed"
+                )
+                add("7-2", "AVI Cloud Connection NSX", "error", r7_2_skip)
+            else:
+                if avi.get("license_ok"):
+                    add("7-1", "AVI Authentication + Licensing", "ok",
+                        avi.get("license_summary") or f"Authenticated to {avi.get('avi_url')}",
+                        avi.get("license_details", ""))
+                else:
+                    add("7-1", "AVI Authentication + Licensing", "warning",
+                        avi.get("license_warn_reason") or "Authenticated, but AVI license check returned a warning",
+                        avi.get("license_details", ""))
+
+                if avi.get("nsx_cloud_ok"):
+                    add("7-2", "AVI Cloud Connection NSX", "ok",
+                        avi.get("nsx_cloud_msg") or "NSX Cloud connector is Green",
+                        avi.get("nsx_cloud_details", ""))
+                else:
+                    add("7-2", "AVI Cloud Connection NSX", "error",
+                        avi.get("nsx_cloud_msg") or "NSX Cloud connector is not ready",
+                        avi.get("nsx_cloud_details", ""))
+
         return checks
 
-    return jsonify({
+    return jsonify({"avi_discovery": _discover_avi_from_nsx(nsx_url, nsx_user, nsx_pass), 
         "modes": {
             "distributed": build_checks("distributed"),
             "centralized":  build_checks("centralized"),

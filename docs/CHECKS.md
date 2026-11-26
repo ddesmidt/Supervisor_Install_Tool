@@ -28,8 +28,10 @@ Step badges in the UI use an **R prefix** (R1, R2, R3, R5-1 …) to stand for "R
 | R4 | VNA Cluster / Edge Cluster | NSX only |
 | R5-1 | External Connection | NSX only |
 | R5-2 | Transit Gateway | NSX only |
-| R5-3 | External IP Block | NSX only |
-| R5-4 | VPC Connectivity Profile | NSX only |
+| R6-3 | External IP Block | NSX only |
+| R6-4 | VPC Connectivity Profile | NSX only |
+| R7-1 | AVI Authentication + Licensing *(when AVI detected)* | NSX only |
+| R7-2 | AVI Cloud Connection NSX *(when AVI detected)* | NSX only |
 
 **VDS/FLB mode** shows Auth, R1, R2, and a single informational step:
 
@@ -407,3 +409,29 @@ Key NSX Policy API paths used by this tool:
 | IP Blocks | `/policy/api/v1/infra/ip-blocks` |
 | VPC Connectivity Profiles | `/policy/api/v1/orgs/default/projects/{id}/vpc-connectivity-profiles` |
 | Overlay Transport Zones | `/policy/api/v1/infra/sites/default/enforcement-points/default/transport-zones` |
+
+---
+
+## R7-1 — AVI Authentication + Licensing *(NSX modes when AVI is detected)*
+
+**What it checks:** When VMware Avi Load Balancer (NSX ALB) is detected in NSX (or enabled in Deployment Options), verifies connectivity, authentication, cluster health, and Enterprise licensing on the AVI Controller.
+
+**How it works:**
+1. **Auto-discovery from NSX:** Queries NSX Policy objects (`tags.tag:AVICLOUD_UUID`), NSX pinned certificates (`AVI-Portal-Cert`), and NSX Principal Identities (`alb`/`avi`) to auto-discover the AVI Controller IP/FQDN.
+2. **Authentication & Cluster Runtime:** Authenticates via `POST /login` and inspects `/api/cluster/runtime` and `/api/systemconfiguration`.
+3. **Enterprise Licensing Validation:** Queries `/api/licensing` and `/api/licensing/status` to confirm the default license tier is **Enterprise** (required for vSphere Supervisor) and that active license capacity or Pulse/CLS cloud licensing is available.
+
+**Fix:** Not automated — ensure the AVI Controller is reachable on TCP 443, enter valid `admin` credentials, and verify an active Enterprise license is applied.
+
+---
+
+## R7-2 — AVI Cloud Connection NSX *(NSX modes when AVI is detected)*
+
+**What it checks:** Verifies that an NSX Cloud connector (`CLOUD_NSXT`) is configured on the AVI Controller, matches the target NSX Manager and vCenter Server, and is in a healthy `CLOUD_STATE_PLACEMENT_READY` (Green) state.
+
+**How it works:**
+1. Queries `GET /api/cloud` for clouds with `vtype == "CLOUD_NSXT"` and maps linked vCenter Servers via `GET /api/vcenterserver`.
+2. Matches `nsxt_configuration.nsxt_url` and linked vCenter hostnames against the vCenter and NSX Manager entered in **Connection Details**.
+3. Queries `GET /api/cloud/<uuid>/status` and verifies the connector state is `CLOUD_STATE_PLACEMENT_READY`.
+
+**Fix:** Not automated — configure or remediate the `CLOUD_NSXT` Cloud connector in the Avi Controller UI so its status reports Green/Ready.

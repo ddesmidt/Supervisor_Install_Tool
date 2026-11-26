@@ -9,9 +9,10 @@ A web application that guides you through checking prerequisites and deploying *
 The tool is a self-hosted Flask web app deployed on a VM inside your VCF environment. It connects directly to your vCenter and NSX Manager APIs to:
 
 1. **Check if Supervisor is already installed** on a vCenter cluster
-2. **Verify all NSX prerequisites** are in place for your chosen deployment mode
-3. **Automatically fix missing prerequisites** via guided wizards
-4. **Deploy Supervisor** once all requirements are met
+2. **Auto-detect VMware Avi Load Balancer (NSX ALB)** integration in NSX and validate AVI licensing and NSX Cloud connector health
+3. **Verify all NSX and AVI prerequisites** are in place for your chosen deployment mode
+4. **Automatically fix missing prerequisites** via guided wizards
+5. **Deploy Supervisor** once all requirements are met
 
 It supports all three vSphere Supervisor deployment modes:
 
@@ -52,6 +53,8 @@ The tool displays three side-by-side columns — one per deployment mode — eac
 | ✅ Distributed TGW | ❌ Centralized TGW | — (not required) |
 | ✅ External IP Block | ❌ External IP Block | — (not required) |
 | ✅ VPC Profile | ❌ VPC Profile | — (not required) |
+| ✅ AVI Auth + Licensing *(if AVI)* | ✅ AVI Auth + Licensing *(if AVI)* | — (not required) |
+| ✅ AVI NSX Cloud *(if AVI)* | ✅ AVI NSX Cloud *(if AVI)* | — (not required) |
 | **\[ Deploy Supervisor \]** | **\[ Deploy — disabled \]** | **\[ Deploy — n/a \]** |
 
 ---
@@ -183,6 +186,7 @@ Supervisor_Intall_Tool/
 |---|---|
 | vCenter (WLD) | `administrator@vsphere.local` or SSO user (auto-detected) |
 | NSX Manager | `admin` |
+| Avi Load Balancer *(when detected)* | `admin` |
 
 Credentials are entered in the browser and sent to the Flask backend per-request. They are never stored on disk.
 
