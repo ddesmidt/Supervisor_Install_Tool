@@ -15,7 +15,7 @@ The tool runs the same set of checks against three deployment modes in parallel.
 | ❌ Red | Requirement not met — must be fixed before deploying |
 | ℹ️ Info / To Validate | Informational — manual validation required (used for VDS/FLB) |
 
-Step badges in the UI use an **R prefix** (R1, R2, R3, R5-1 …) to stand for "Requirement".
+Step badges in the UI use an **R prefix** (R1, R2, R3, R6-1 …) to stand for "Requirement".
 
 **Step order (NSX modes):**
 
@@ -26,8 +26,8 @@ Step badges in the UI use an **R prefix** (R1, R2, R3, R5-1 …) to stand for "R
 | R2 | vSphere HA / DRS | ✅ |
 | R3 | NSX Host Preparation | NSX only |
 | R4 | VNA Cluster / Edge Cluster | NSX only |
-| R5-1 | External Connection | NSX only |
-| R5-2 | Transit Gateway | NSX only |
+| R6-1 | External Connection | NSX only |
+| R6-2 | Transit Gateway | NSX only |
 | R6-3 | External IP Block | NSX only |
 | R6-4 | VPC Connectivity Profile | NSX only |
 | R7-1 | AVI Authentication + Licensing *(when AVI detected)* | NSX only |
@@ -177,11 +177,11 @@ This step differs significantly between modes.
 
 ---
 
-## R5-1 — Distributed / Centralized External Connection
+## R6-1 — Distributed / Centralized External Connection
 
 This step differs between modes.
 
-### R5-1 — Distributed: Distributed External Connection
+### R6-1 — Distributed: Distributed External Connection
 
 **What it checks:** Is there at least one **Distributed VLAN Connection** in NSX?
 
@@ -196,12 +196,12 @@ This step differs between modes.
 
 **Fix wizard (automated):** Creates a new Distributed VLAN Connection — prompts for name, VLAN ID, and gateway CIDR.
 
-**Cascade mode:** The R5-1 fix wizard offers an optional **"Also auto-fix R5-2, R5-3, R5-4"** checkbox. When enabled, after R5-1 succeeds the tool automatically runs R5-2 (TGW attachment), R5-3 (External IP Block), and R5-4 (VPC Profile) in sequence, showing per-step progress. Steps that cannot run due to missing data (e.g. no VNA Cluster yet) are skipped with a warning.
+**Cascade mode:** The R6-1 fix wizard offers an optional **"Also auto-fix R6-2, R6-3, R6-4"** checkbox. When enabled, after R6-1 succeeds the tool automatically runs R6-2 (TGW attachment), R6-3 (External IP Block), and R6-4 (VPC Profile) in sequence, showing per-step progress. Steps that cannot run due to missing data (e.g. no VNA Cluster yet) are skipped with a warning.
 
 **Open in vCenter:** An **"Open in vCenter (Ext. Conn.)"** link button opens the External Connections page directly in the vSphere Client.
 
 **Check Ext. Conn. button:**
-Once R5-1 through R5-4 are all green, a **"Check Ext. Conn."** button appears on R5-1 in the Distributed steps panel. It verifies end-to-end VLAN reachability on every ESX host and validates that the External IP Block's exclusion list is complete.
+Once R6-1 through R6-4 are all green, a **"Check Ext. Conn."** button appears on R6-1 in the Distributed steps panel. It verifies end-to-end VLAN reachability on every ESX host and validates that the External IP Block's exclusion list is complete.
 
 The check runs in three phases:
 
@@ -229,7 +229,7 @@ The check runs in three phases:
 - The button turns green only when all hosts pass the gateway ping **and** no conflicts were found; red otherwise
 - All temporary VMkernel NICs and the DVPortGroup are removed automatically after the test
 
-### R5-1 — Centralized: Centralized External Connection
+### R6-1 — Centralized: Centralized External Connection
 
 **What it checks:** Is there at least one **Gateway Connection** (Tier-0 backed) in NSX?
 
@@ -247,9 +247,9 @@ The check runs in three phases:
 
 ---
 
-## R5-2 — Distributed / Centralized Transit Gateway
+## R6-2 — Distributed / Centralized Transit Gateway
 
-### R5-2 — Distributed: Distributed Transit Gateway
+### R6-2 — Distributed: Distributed Transit Gateway
 
 **What it checks:** Is there at least one Transit Gateway (TGW) that has an attachment pointing to a Distributed VLAN Connection?
 
@@ -273,7 +273,7 @@ The check runs in three phases:
 
 **Open in vCenter:** An **"Open in vCenter (Trans. GW)"** link button opens the Transit Gateway detail page directly in the vSphere Client, pre-navigating to the specific TGW found by the check.
 
-### R5-2 — Centralized: Centralized Transit Gateway
+### R6-2 — Centralized: Centralized Transit Gateway
 
 **What it checks:** Is there at least one TGW with an attachment pointing to a Gateway Connection?
 
@@ -292,7 +292,7 @@ The Edge Cluster is read from `GET /…/transit-gateways/{id}/centralized-config
 
 ---
 
-## R5-3 — External IP Block
+## R6-3 — External IP Block
 
 **What it checks:** Is there at least one NSX IP Block with `visibility = EXTERNAL`?
 
@@ -325,7 +325,7 @@ Excluded ranges are read from the NSX native `excluded_ips` field (`[{start, end
 
 ---
 
-## R5-4 — Distributed / Centralized VPC Connectivity Profile
+## R6-4 — Distributed / Centralized VPC Connectivity Profile
 
 **What it checks:** Does the NSX Default Project have a VPC Connectivity Profile that satisfies all of the following?
 
@@ -382,7 +382,7 @@ When the satisfying profile is in a **non-default NSX project**, the button chan
 
 ## VDS/FLB — R3 (VLANs/Subnets for Supervisor and FLB)
 
-The VDS/FLB column shows Auth, R1, and R2 (same as the NSX modes), then a single informational step instead of the NSX-specific steps R3–R5-4.
+The VDS/FLB column shows Auth, R1, and R2 (same as the NSX modes), then a single informational step instead of the NSX-specific steps R3–R6-4.
 
 **What it shows:** A reminder that deploying Supervisor with VDS requires the admin to pre-configure the correct VLANs and subnets for the Supervisor control plane and FLB networking. The tool does not automate or validate these for VDS/FLB mode.
 

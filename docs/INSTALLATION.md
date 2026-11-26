@@ -88,7 +88,7 @@ pwsh -Command "Get-Module -ListAvailable VMware.PowerCLI | Select Name, Version"
 
 > **Note:** If the VM has no internet access, install PowerCLI offline by downloading the module on a connected machine and copying it to `/usr/local/share/powershell/Modules/`.
 
-> **Note:** The Check Ext. Conn. button is only shown when R5-1 through R5-4 are all green. If you do not use this feature, PowerShell and PowerCLI are not required.
+> **Note:** The Check Ext. Conn. button is only shown when R6-1 through R6-4 are all green. If you do not use this feature, PowerShell and PowerCLI are not required.
 
 ---
 

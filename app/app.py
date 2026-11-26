@@ -1982,7 +1982,7 @@ def check_requirements():
                     if mode == "distributed":
                         if not dvlan_nets:
                             ext_detail = (
-                                "No Distributed External Connection found (Step R5-1).\n"
+                                "No Distributed External Connection found (Step R6-1).\n"
                                 "An External IP Block for Distributed mode requires a Distributed External Connection first —\n"
                                 "its CIDR must match that connection's gateway subnet."
                             )
@@ -1995,7 +1995,7 @@ def check_requirements():
                                                 " but their CIDR does not match any Distributed External Connection subnet.")
                             ext_detail = (
                                 "An External IP Block is required for future Supervisor VIP and NAT allocation.\n"
-                                "In the Distributed option, the CIDR must match the subnet from Step R5-1 "
+                                "In the Distributed option, the CIDR must match the subnet from Step R6-1 "
                                 "(Distributed External Connection)." + overlap_note + "\n"
                                 "This tool will guide you through the creation of an External IP Block."
                             )
@@ -7079,7 +7079,7 @@ def check_vlan():
         dvlans = (nsx_get(nsx_url, nsx_user, nsx_pass,
             "/policy/api/v1/infra/distributed-vlan-connections") or {}).get("results", [])
         if not dvlans:
-            result["error"] = "No Distributed External Connection found — complete R5-1 first."
+            result["error"] = "No Distributed External Connection found — complete R6-1 first."
             return jsonify(result)
         dvlan = next((d for d in dvlans if d.get("id") == dvlan_id_req), dvlans[0])
         vlan_id    = dvlan.get("vlan_id", 0)
@@ -7116,7 +7116,7 @@ def check_vlan():
             except Exception:
                 pass
         if not block_cidr:
-            result["error"] = "No External IP Block matching the DVLAN subnet — complete R5-3 first."
+            result["error"] = "No External IP Block matching the DVLAN subnet — complete R6-3 first."
             return jsonify(result)
 
         # ── 3. Prepared ESX hosts + NSX VDS name ───────────────────────────
