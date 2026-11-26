@@ -6,7 +6,7 @@ This guide walks through deploying the **vSphere Supervisor Readiness Check + In
 
 > A pre-built VM OVA with the application already installed is available on [Box](https://ent.box.com/s/kseyi9f1cnqmefylfx1c9oki1vnzapc4).
 >
-> 2 recorded demos on how to use the application are also available through that Box link.
+> 3 recorded demos on how to use the application are also available through that Box link.
 >
 > After deploying the OVA, the VM will obtain an IP via DHCP. To assign a static IP, log in as `root` (password: `VMware123!VMware123!`) and run the built-in `net-config` script — switch between DHCP and static. See [Network Configuration Script](#network-configuration-script) for details.
 >
